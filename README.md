@@ -85,7 +85,7 @@ Set `BAZIS_BRIDGE_URL` and `BAZIS_BRIDGE_TOKEN` (copied from the Bazis Propertie
 }
 ```
 
-## Available MCP Tools (30)
+## Available MCP Tools (34)
 
 | Tool | Description |
 | --- | --- |
@@ -97,6 +97,10 @@ Set `BAZIS_BRIDGE_URL` and `BAZIS_BRIDGE_TOKEN` (copied from the Bazis Propertie
 | `bazis_panel_butt` | Inspect panel contour edges or apply edge banding (all, visible, or by edge index) |
 | `bazis_panel_cut` | Add a straight groove / dado (`AddCut`) by side+offset or explicit 2D trajectory |
 | `bazis_panel_cutout` | Subtract/add rectangular or circular cutouts/holes in a panel's 2D contour |
+| `bazis_panel_edit_contour` | Edit a panel's 2D contour: rubber-band stretch (`elastic`), `fit`, corner `rounding`/`chamfer`, 2D `symmetry`, `offset`, or `load_frw` |
+| `bazis_panel_plastic` | Add or clear laminate / veneer / plastic facing on a panel's front, back, or both faces |
+| `bazis_object_edit` | 3D editing: `elastic_resize` on elastic blocks/fragments, `copy`/linear array, 3D `mirror`, or `group` into a block/assembly |
+| `bazis_create_profile` | Create 3D profiles via linear `extrusion` (`AddExtrusion`) or path sweep (`AddTrajectory`) |
 | `bazis_list_fasteners` | Scan Bazis Accessories / Fragments folders for `.f3d` fasteners & furniture |
 | `bazis_mount_fastener` | Mount a `.f3d` fastener (`between` two panels with auto seam points, `plane`, `scheme`, or `box`) |
 | `bazis_add_doors` | Add cabinet doors via native `NewDoorsMaker` (`configFile`) or parametrically (1–2 overlay/inset doors, edging, handles) |

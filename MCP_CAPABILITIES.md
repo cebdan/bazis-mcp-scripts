@@ -28,7 +28,7 @@
 - **UIDs:** Every object, block, and panel in Bazis has a stable integer `uid` returned by `bazis_get_model`, `bazis_get_bom`, and creation tools. Pass `uid` / `uids` / `carcassUid` to modify, band, groove, fasten, transform, or delete objects.
 - **File paths:** Bazis runs on Windows. Any tool taking `filename` (`bazis_scene_action`, `bazis_export`) expects a **Windows path**. To share exported files directly with macOS in Parallels, write to your shared folder path (e.g. `Z:\path\to\bazis-mcp-scripts\<name>`).
 
-## 3. MCP Tools Catalog (30 Tools)
+## 3. MCP Tools Catalog (34 Tools)
 
 ### A. Status, Inspection & BOM
 
@@ -63,6 +63,14 @@
     - Adds a straight groove / dado (`AddCut`) on a panel using either a named side + offset or explicit 2D local trajectory coordinates.
 11. **`bazis_panel_cutout`** `{ uid, shape?: "rect"|"circle", mode?: "subtract"|"add"|"hole"|"inner", x1?, y1?, x2?, y2?, cornerRadius?, cx?, cy?, radius? }`
     - Subtracts or adds a rectangle (optional rounded corners) or circle to a panel's 2D contour, or creates an inner circular hole (`mode: "hole"`).
+12. **`bazis_panel_edit_contour`** `{ uid, action?: "elastic"|"fit"|"rounding"|"chamfer"|"symmetry"|"offset"|"load_frw", x1?, y1?, x2?, y2?, dx?, dy?, x?, y?, radius?, length?, corners?, copy?, offset?, side?, rounding?, replace?, file?, viewAll? }`
+    - Full 2D contour editing on a panel: rubber-band stretch (`Contour.Elastic`), fit (`Contour.Fit`), single or batch corner rounding (`Rounding`) and chamfers (`Facet`), 2D mirror (`Symmetry`), equidistant offset (`AddEquidistant`), and `.frw` contour loading (`Load`).
+13. **`bazis_panel_plastic`** `{ uid, action?: "add"|"clear", side?: "front"|"back"|"both", material?, thickness? }`
+    - Adds or clears laminate/veneer/plastic facing on a panel's front, back, or both faces.
+14. **`bazis_object_edit`** `{ action: "elastic_resize"|"copy"|"mirror"|"group", uid?, uids?, name?, asAssembly?, size?, count?, offset?, plane?, coord?, point?, normal?, deleteOriginal?, viewAll? }`
+    - 3D editing operations: `elastic_resize` (`ElasticResize`), `copy` / linear array (`AddCopy`), 3D `mirror` (`AddSymmetry`), and `group` into a Block or Assembly (`AddBlock` / `AddAssembly`).
+15. **`bazis_create_profile`** `{ mode?: "extrusion"|"trajectory", name?, materialName?, length?, profile?, trajectory?, position?, rotate?, viewAll? }`
+    - Creates linear extrusion profiles (`AddExtrusion`) or swept profiles along a 2D path (`AddTrajectory`) for moldings, plinths, handle profiles, and cornices.
 
 ### D. Fasteners & Hardware (`.f3d`)
 

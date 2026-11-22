@@ -1150,6 +1150,156 @@ const TOOLS = [
     },
   },
   {
+    name: "bazis_panel_edit_contour",
+    description:
+      "Edit a panel's 2D contour by UID: rubber-band stretch ('elastic'), fit to rectangle ('fit'), corner rounding/fillet ('rounding'), corner chamfer ('chamfer'), 2D mirror ('symmetry'), equidistant offset ('offset'), or load a .frw contour ('load_frw').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uid: { type: "integer", description: "Target panel UID." },
+        action: {
+          type: "string",
+          enum: ["elastic", "fit", "rounding", "chamfer", "symmetry", "offset", "load_frw"],
+          description: "Contour edit operation (default 'elastic').",
+        },
+        x1: { type: "number", description: "Selection/fit/axis start X (local 2D mm)." },
+        y1: { type: "number", description: "Selection/fit/axis start Y (local 2D mm)." },
+        x2: { type: "number", description: "Selection/fit/axis end X (local 2D mm)." },
+        y2: { type: "number", description: "Selection/fit/axis end Y (local 2D mm)." },
+        dx: { type: "number", description: "Rubber-band stretch delta X in mm (for action='elastic')." },
+        dy: { type: "number", description: "Rubber-band stretch delta Y in mm (for action='elastic')." },
+        x: { type: "number", description: "Single corner X (for rounding/chamfer)." },
+        y: { type: "number", description: "Single corner Y (for rounding/chamfer)." },
+        radius: { type: "number", description: "Corner rounding radius in mm (for action='rounding')." },
+        length: { type: "number", description: "Corner chamfer length in mm (for action='chamfer')." },
+        corners: {
+          type: "array",
+          description: "Optional list of corners [{x, y, radius|length}] for batch rounding/chamfer.",
+          items: {
+            type: "object",
+            properties: {
+              x: { type: "number" },
+              y: { type: "number" },
+              radius: { type: "number" },
+              length: { type: "number" },
+            },
+          },
+        },
+        copy: { type: "boolean", description: "Keep original contour when mirroring (for action='symmetry')." },
+        offset: { type: "number", description: "Equidistant offset in mm (for action='offset')." },
+        side: { type: "boolean", description: "Offset direction flag (default true)." },
+        rounding: { type: "boolean", description: "Round offset corners (default false)." },
+        replace: { type: "boolean", description: "Replace original contour with offset contour (default true)." },
+        file: { type: "string", description: "Windows path to .frw contour file (for action='load_frw')." },
+        viewAll: { type: "boolean" },
+      },
+      required: ["uid"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bazis_object_edit",
+    description:
+      "3D object editing operations: elastic resize of an elastic block/fragment ('elastic_resize'), copy or linear array ('copy'), 3D mirror/symmetry ('mirror'), or group multiple UIDs into a block/assembly ('group').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["elastic_resize", "copy", "mirror", "group"],
+          description: "3D editing operation.",
+        },
+        uid: { type: "integer", description: "Target object UID (for elastic_resize, copy, mirror)." },
+        uids: {
+          type: "array",
+          items: { type: "integer" },
+          description: "Array of object UIDs to group (for action='group').",
+        },
+        name: { type: "string", description: "Name for the copied, mirrored, or grouped object." },
+        asAssembly: { type: "boolean", description: "Create an Assembly instead of a Block (for action='group')." },
+        size: {
+          type: "object",
+          description: "Target 3D bounding size {x, y, z} in mm (for action='elastic_resize').",
+          properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+        },
+        count: { type: "integer", minimum: 1, maximum: 50, description: "Number of copies (for action='copy', default 1)." },
+        offset: {
+          type: "object",
+          description: "Per-copy translation offset {x, y, z} in mm (for action='copy').",
+          properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+        },
+        plane: { type: "string", enum: ["yz", "xz", "xy"], description: "Mirror plane shortcut (default 'yz')." },
+        coord: { type: "number", description: "Coordinate of the mirror plane along its normal axis (default 0)." },
+        point: {
+          type: "object",
+          description: "Explicit point on the mirror plane {x, y, z}.",
+          properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+        },
+        normal: {
+          type: "object",
+          description: "Explicit mirror plane normal vector {x, y, z}.",
+          properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+        },
+        deleteOriginal: { type: "boolean", description: "Delete the original object after mirroring (default false)." },
+        viewAll: { type: "boolean" },
+      },
+      required: ["action"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bazis_panel_plastic",
+    description:
+      "Add or clear laminate / veneer / plastic facing on a panel's front, back, or both faces by UID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uid: { type: "integer", description: "Target panel UID." },
+        action: { type: "string", enum: ["add", "clear"], description: "'add' (default) or 'clear'." },
+        side: { type: "string", enum: ["front", "back", "both"], description: "Target panel face(s) (default 'front')." },
+        material: { type: "string", description: "Plastic/laminate material name (required for action='add')." },
+        thickness: { type: "number", description: "Plastic thickness in mm (default 0.8)." },
+      },
+      required: ["uid"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bazis_create_profile",
+    description:
+      "Create a 3D profile by linear extrusion ('extrusion' via AddExtrusion) or swept along a 2D path ('trajectory' via AddTrajectory) — useful for moldings, plinths, handle profiles, cornices, and frames.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["extrusion", "trajectory"], description: "'extrusion' (default) or 'trajectory'." },
+        name: { type: "string", description: "Object name." },
+        materialName: { type: "string", description: "Profile material name." },
+        length: { type: "number", description: "Extrusion length in mm (for mode='extrusion', default 600)." },
+        profile: {
+          type: "object",
+          description: "2D cross-section spec: { shape: 'rect'|'circle', width, height, radius, points: [{x,y}], closed, frwFile }.",
+        },
+        trajectory: {
+          type: "object",
+          description: "2D sweep path spec (for mode='trajectory'): { points: [{x,y}], closed, shape, width, height, frwFile }.",
+        },
+        position: {
+          type: "object",
+          properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+        },
+        rotate: {
+          type: "object",
+          properties: {
+            axis: { type: "string", enum: ["x", "y", "z"] },
+            angle: { type: "number" },
+          },
+        },
+        viewAll: { type: "boolean" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "bazis_eval",
     description:
       "Execute arbitrary JavaScript inside Bazis-Mebelshchik 2022 with full access to the Bazis API (Model, Action, ActiveMaterial, Undo, AddHorizPanel, AddVertPanel, AddFrontPanel, BeginBlock/EndBlock, etc.). Inside 'code', use 'log(...)' to capture output, 'params' for input parameters, and 'return ...' for the JSON-serializable return value. Note: calling Action.Commit() invalidates pre-commit JS handles to newly created objects—read committed objects back from Model after committing.",
@@ -1199,6 +1349,14 @@ async function executeTool(name, args) {
       return callBridge("POST", "/panel/cut", params);
     case "bazis_panel_cutout":
       return callBridge("POST", "/panel/cutout", params);
+    case "bazis_panel_edit_contour":
+      return callBridge("POST", "/panel/contour", params);
+    case "bazis_panel_plastic":
+      return callBridge("POST", "/panel/plastic", params);
+    case "bazis_object_edit":
+      return callBridge("POST", "/object/edit", params);
+    case "bazis_create_profile":
+      return callBridge("POST", "/profile", params);
     case "bazis_list_fasteners": {
       const q = [];
       if (params.filter) q.push(`filter=${encodeURIComponent(String(params.filter))}`);

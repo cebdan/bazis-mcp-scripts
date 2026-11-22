@@ -3310,6 +3310,398 @@ function handleDbExecute(body) {
     };
 }
 
+// =========================================================================
+// Advanced editing tools: 2D rubber-band/contour editing, 3D elastic/copy/
+// mirror/group, panel plastics, and Extrusion/Trajectory profiles
+// =========================================================================
+
+function handlePanelEditContour(body) {
+    var reqBody = body || {};
+    if (reqBody.uid === undefined || reqBody.uid === null) {
+        throw new Error("Provide 'uid' of the target panel");
+    }
+    var panel = resolvePanelByUid(reqBody.uid, "uid");
+    var action = String(reqBody.action || "elastic").toLowerCase();
+
+    try { Undo.Changing(panel); } catch (e) {}
+
+    var c = panel.Contour;
+    var details = {};
+
+    if (action === "elastic") {
+        var x1 = Number(reqBody.x1 || 0);
+        var y1 = Number(reqBody.y1 || 0);
+        var x2 = Number(reqBody.x2 || 0);
+        var y2 = Number(reqBody.y2 || 0);
+        var dx = Number(reqBody.dx || 0);
+        var dy = Number(reqBody.dy || 0);
+        c.Elastic(x1, y1, x2, y2, dx, dy);
+        details = { x1: x1, y1: y1, x2: x2, y2: y2, dx: dx, dy: dy };
+    } else if (action === "fit") {
+        var fx1 = Number(reqBody.x1 || 0);
+        var fy1 = Number(reqBody.y1 || 0);
+        var fx2 = Number(reqBody.x2 || 0);
+        var fy2 = Number(reqBody.y2 || 0);
+        c.Fit(fx1, fy1, fx2, fy2);
+        details = { x1: fx1, y1: fy1, x2: fx2, y2: fy2 };
+    } else if (action === "rounding" || action === "fillet") {
+        var corners = Array.isArray(reqBody.corners) && reqBody.corners.length > 0
+            ? reqBody.corners
+            : [{ x: Number(reqBody.x || 0), y: Number(reqBody.y || 0), radius: Number(reqBody.radius || 10) }];
+        for (var i = 0; i < corners.length; i++) {
+            var r = corners[i];
+            c.Rounding(Number(r.x || 0), Number(r.y || 0), Number(r.radius !== undefined ? r.radius : (reqBody.radius || 10)));
+        }
+        details = { cornersApplied: corners.length };
+    } else if (action === "chamfer" || action === "facet") {
+        var fCorners = Array.isArray(reqBody.corners) && reqBody.corners.length > 0
+            ? reqBody.corners
+            : [{ x: Number(reqBody.x || 0), y: Number(reqBody.y || 0), length: Number(reqBody.length || 10) }];
+        for (var j = 0; j < fCorners.length; j++) {
+            var f = fCorners[j];
+            c.Facet(Number(f.x || 0), Number(f.y || 0), Number(f.length !== undefined ? f.length : (reqBody.length || 10)));
+        }
+        details = { cornersApplied: fCorners.length };
+    } else if (action === "symmetry" || action === "mirror") {
+        var sx1 = Number(reqBody.x1 || 0);
+        var sy1 = Number(reqBody.y1 || 0);
+        var sx2 = Number(reqBody.x2 || 0);
+        var sy2 = Number(reqBody.y2 || 0);
+        var copy = reqBody.copy === true;
+        c.Symmetry(sx1, sy1, sx2, sy2, copy);
+        details = { x1: sx1, y1: sy1, x2: sx2, y2: sy2, copy: copy };
+    } else if (action === "offset" || action === "equidistant") {
+        var offset = Number(reqBody.offset || 0);
+        var side = reqBody.side !== false;
+        var rounding = reqBody.rounding === true;
+        var clone = NewContour();
+        clone.Addition(c);
+        if (reqBody.replace !== false) {
+            c.Clear();
+        }
+        c.AddEquidistant(clone, offset, side, rounding);
+        details = { offset: offset, side: side, rounding: rounding };
+    } else if (action === "load_frw") {
+        if (!reqBody.file) throw new Error("Provide 'file' path to a .frw contour file");
+        var loaded = c.Load(String(reqBody.file));
+        if (!loaded) throw new Error("Contour.Load failed for: " + reqBody.file);
+        details = { file: String(reqBody.file), loaded: true };
+    } else {
+        throw new Error("Unsupported contour action: " + action);
+    }
+
+    panel.Build();
+    Action.Commit();
+    if (reqBody.viewAll) ViewAll();
+
+    var refreshed = findObjectByUid(Number(reqBody.uid));
+    return {
+        action: action,
+        details: details,
+        panel: refreshed ? serializeObject(refreshed, 0, 2) : null
+    };
+}
+
+function handleObjectEdit(body) {
+    var reqBody = body || {};
+    var action = String(reqBody.action || "").toLowerCase();
+    if (!action) throw new Error("Provide 'action' ('elastic_resize', 'copy', 'mirror', or 'group')");
+
+    if (action === "group") {
+        var uids = Array.isArray(reqBody.uids) ? reqBody.uids : [];
+        if (uids.length === 0) throw new Error("Provide non-empty 'uids' array for action='group'");
+        var objs = [];
+        for (var g = 0; g < uids.length; g++) {
+            var o = findObjectByUid(Number(uids[g]));
+            if (!o) throw new Error("Object UID " + uids[g] + " not found");
+            objs.push(o);
+        }
+        var groupName = String(reqBody.name || "Group");
+        var isAssembly = reqBody.asAssembly === true;
+        var prevCount = safeGet(function () { return Model.Count; }, 0);
+        var container = isAssembly ? AddAssembly(groupName) : AddBlock(groupName);
+        for (var k = 0; k < objs.length; k++) {
+            try { Undo.Changing(objs[k]); } catch (e) {}
+            objs[k].Owner = container;
+        }
+        Action.Commit();
+        if (reqBody.viewAll) ViewAll();
+        var newCount = safeGet(function () { return Model.Count; }, 0);
+        var created = newCount > prevCount ? safeGet(function () { return Model.Objects[newCount - 1]; }, null) : null;
+        return {
+            action: "group",
+            asAssembly: isAssembly,
+            groupedCount: objs.length,
+            object: created ? serializeObject(created, 0, 3) : null
+        };
+    }
+
+    if (reqBody.uid === undefined || reqBody.uid === null) {
+        throw new Error("Provide 'uid' of the target object");
+    }
+    var target = findObjectByUid(Number(reqBody.uid));
+    if (!target) throw new Error("Object UID " + reqBody.uid + " not found");
+
+    if (action === "elastic_resize") {
+        var isEl = safeGet(function () { return typeof target.IsElastic === "function" && target.IsElastic(); }, false);
+        if (!isEl) {
+            throw new Error("Object UID " + reqBody.uid + " is not elastic (IsElastic() === false)");
+        }
+        var sz = reqBody.size || {};
+        var curMin = safeGet(function () { return target.GabMin; }, { x: 0, y: 0, z: 0 });
+        var curMax = safeGet(function () { return target.GabMax; }, { x: 0, y: 0, z: 0 });
+        var nx = typeof sz.x === "number" ? sz.x : (curMax.x - curMin.x);
+        var ny = typeof sz.y === "number" ? sz.y : (curMax.y - curMin.y);
+        var nz = typeof sz.z === "number" ? sz.z : (curMax.z - curMin.z);
+        try { Undo.RecursiveChanging(target); } catch (e) { try { Undo.Changing(target); } catch (e2) {} }
+        target.ElasticResize(NewVector(nx, ny, nz));
+        Action.Commit();
+        if (reqBody.viewAll) ViewAll();
+        var after = findObjectByUid(Number(reqBody.uid));
+        return {
+            action: "elastic_resize",
+            requestedSize: { x: nx, y: ny, z: nz },
+            object: after ? serializeObject(after, 0, 3) : null
+        };
+    }
+
+    if (action === "copy") {
+        var count = Math.max(1, Math.min(50, Math.floor(Number(reqBody.count || 1))));
+        var off = reqBody.offset || { x: 0, y: 0, z: 0 };
+        var dx = Number(off.x || 0);
+        var dy = Number(off.y || 0);
+        var dz = Number(off.z || 0);
+        var prevC = safeGet(function () { return Model.Count; }, 0);
+        for (var ci = 1; ci <= count; ci++) {
+            var copyObj = AddCopy(target);
+            if (reqBody.name) {
+                copyObj.Name = count > 1 ? (String(reqBody.name) + " " + ci) : String(reqBody.name);
+            }
+            if (dx !== 0 || dy !== 0 || dz !== 0) {
+                copyObj.Translate(dx * ci, dy * ci, dz * ci);
+            }
+        }
+        Action.Commit();
+        if (reqBody.viewAll) ViewAll();
+        var newC = safeGet(function () { return Model.Count; }, 0);
+        var copies = [];
+        for (var m = prevC; m < newC; m++) {
+            var co = safeGet(function () { return Model.Objects[m]; }, null);
+            if (co) copies.push(serializeObject(co, 0, 2));
+        }
+        return {
+            action: "copy",
+            sourceUid: Number(reqBody.uid),
+            createdCount: copies.length,
+            created: copies
+        };
+    }
+
+    if (action === "mirror" || action === "symmetry") {
+        var pos = reqBody.point || { x: 0, y: 0, z: 0 };
+        var norm = reqBody.normal || null;
+        if (!norm) {
+            var pl = String(reqBody.plane || "yz").toLowerCase();
+            var coord = typeof reqBody.coord === "number" ? reqBody.coord : 0;
+            if (pl === "yz" || pl === "x") {
+                pos = { x: coord, y: 0, z: 0 };
+                norm = { x: 1, y: 0, z: 0 };
+            } else if (pl === "xz" || pl === "y") {
+                pos = { x: 0, y: coord, z: 0 };
+                norm = { x: 0, y: 1, z: 0 };
+            } else if (pl === "xy" || pl === "z") {
+                pos = { x: 0, y: 0, z: coord };
+                norm = { x: 0, y: 0, z: 1 };
+            } else {
+                throw new Error("Invalid mirror plane '" + pl + "' (use 'yz', 'xz', 'xy', or explicit point + normal)");
+            }
+        }
+        var prevM = safeGet(function () { return Model.Count; }, 0);
+        var mirrored = AddSymmetry(target, NewVector(Number(pos.x || 0), Number(pos.y || 0), Number(pos.z || 0)), NewVector(Number(norm.x || 0), Number(norm.y || 0), Number(norm.z || 0)));
+        if (reqBody.name && mirrored) {
+            mirrored.Name = String(reqBody.name);
+        }
+        if (reqBody.deleteOriginal === true) {
+            DeleteObject(target);
+        }
+        Action.Commit();
+        if (reqBody.viewAll) ViewAll();
+        var newM = safeGet(function () { return Model.Count; }, 0);
+        var createdObj = newM > prevM ? safeGet(function () { return Model.Objects[newM - 1]; }, null) : null;
+        return {
+            action: "mirror",
+            point: pos,
+            normal: norm,
+            deleteOriginal: reqBody.deleteOriginal === true,
+            object: createdObj ? serializeObject(createdObj, 0, 2) : null
+        };
+    }
+
+    throw new Error("Unsupported object edit action: " + action);
+}
+
+function handlePanelPlastic(body) {
+    var reqBody = body || {};
+    if (reqBody.uid === undefined || reqBody.uid === null) {
+        throw new Error("Provide 'uid' of the target panel");
+    }
+    var panel = resolvePanelByUid(reqBody.uid, "uid");
+    var action = String(reqBody.action || "add").toLowerCase();
+    var side = String(reqBody.side || "front").toLowerCase(); // front | back | both
+
+    try { Undo.Changing(panel); } catch (e) {}
+
+    if (action === "clear") {
+        var plastics = safeGet(function () { return panel.Plastics; }, null);
+        var removed = 0;
+        if (plastics) {
+            var count = safeGet(function () { return plastics.Count; }, 0);
+            for (var i = count - 1; i >= 0; i--) {
+                var pl = plastics[i];
+                var isFront = safeGet(function () { return !!pl.Front; }, true);
+                if (side === "both" || (side === "front" && isFront) || (side === "back" && !isFront)) {
+                    plastics.Delete(i);
+                    removed++;
+                }
+            }
+        }
+        panel.Build();
+        Action.Commit();
+        var afterClear = findObjectByUid(Number(reqBody.uid));
+        return { action: "clear", side: side, removed: removed, panel: afterClear ? serializeObject(afterClear, 0, 2) : null };
+    }
+
+    if (!reqBody.material) {
+        throw new Error("Provide 'material' name for panel plastic/laminate");
+    }
+    var thickness = typeof reqBody.thickness === "number" ? reqBody.thickness : 0.8;
+    var matStr = String(reqBody.material);
+    var prevMatName = safeGet(function () { return ActiveMaterial.Name; }, "");
+    var prevMatThick = safeGet(function () { return ActiveMaterial.Thickness; }, 16);
+    var added = 0;
+
+    try {
+        var sides = side === "both" ? [true, false] : [side !== "back"];
+        for (var s = 0; s < sides.length; s++) {
+            var p = panel.AddPlastic(matStr, sides[s]);
+            if (p && typeof thickness === "number") {
+                try { p.Thickness = thickness; } catch (e) {}
+            }
+            added++;
+        }
+        panel.Build();
+    } finally {
+        if (prevMatName) {
+            try { ActiveMaterial.Make(prevMatName, prevMatThick); } catch (e) {}
+        }
+    }
+
+    Action.Commit();
+    var refreshed = findObjectByUid(Number(reqBody.uid));
+    return {
+        action: "add",
+        material: matStr,
+        thickness: thickness,
+        side: side,
+        added: added,
+        panel: refreshed ? serializeObject(refreshed, 0, 2) : null
+    };
+}
+
+function fillContour2DFromSpec(contour, spec) {
+    var s = spec || {};
+    if (s.frwFile) {
+        if (!contour.Load(String(s.frwFile))) {
+            throw new Error("Failed to load .frw contour: " + s.frwFile);
+        }
+        return;
+    }
+    if (Array.isArray(s.points) && s.points.length >= 2) {
+        var pts = s.points;
+        for (var i = 0; i < pts.length - 1; i++) {
+            contour.AddLine(Number(pts[i].x || 0), Number(pts[i].y || 0), Number(pts[i + 1].x || 0), Number(pts[i + 1].y || 0));
+        }
+        if (s.closed !== false && pts.length >= 3) {
+            var last = pts[pts.length - 1];
+            var first = pts[0];
+            if (last.x !== first.x || last.y !== first.y) {
+                contour.AddLine(Number(last.x || 0), Number(last.y || 0), Number(first.x || 0), Number(first.y || 0));
+            }
+        }
+        return;
+    }
+    var shape = String(s.shape || "rect").toLowerCase();
+    if (shape === "circle") {
+        contour.AddCircle(Number(s.cx || 0), Number(s.cy || 0), Number(s.radius || 10));
+    } else {
+        var w = Number(s.width || 40);
+        var h = Number(s.height || 20);
+        var x1 = s.x1 !== undefined ? Number(s.x1) : 0;
+        var y1 = s.y1 !== undefined ? Number(s.y1) : 0;
+        var x2 = s.x2 !== undefined ? Number(s.x2) : (x1 + w);
+        var y2 = s.y2 !== undefined ? Number(s.y2) : (y1 + h);
+        contour.AddRectangle(x1, y1, x2, y2);
+    }
+}
+
+function handleCreateProfile(body) {
+    var reqBody = body || {};
+    var mode = String(reqBody.mode || "extrusion").toLowerCase();
+    var name = String(reqBody.name || (mode === "trajectory" ? "Trajectory Profile" : "Extrusion Profile"));
+    var prevCount = safeGet(function () { return Model.Count; }, 0);
+
+    var obj;
+    if (mode === "trajectory") {
+        obj = AddTrajectory(name);
+        fillContour2DFromSpec(obj.Contour2D, reqBody.profile || { shape: "rect", width: 40, height: 20 });
+        var trajSpec = reqBody.trajectory || { points: [{ x: 0, y: 0 }, { x: 600, y: 0 }], closed: false };
+        if (trajSpec.closed === undefined && Array.isArray(trajSpec.points)) {
+            trajSpec.closed = false;
+        }
+        fillContour2DFromSpec(obj.Trajectory2D, trajSpec);
+    } else {
+        obj = AddExtrusion(name);
+        fillContour2DFromSpec(obj.Contour, reqBody.profile || {
+            shape: reqBody.shape || "rect",
+            width: reqBody.width || 40,
+            height: reqBody.height || 20,
+            radius: reqBody.radius,
+            points: reqBody.points,
+            frwFile: reqBody.frwFile
+        });
+        obj.Thickness = Number(reqBody.length !== undefined ? reqBody.length : (reqBody.thickness || 600));
+    }
+
+    if (reqBody.materialName) {
+        try { obj.MaterialName = String(reqBody.materialName); } catch (e) {}
+    }
+    if (reqBody.position && typeof reqBody.position === "object") {
+        obj.Translate(
+            Number(reqBody.position.x || 0),
+            Number(reqBody.position.y || 0),
+            Number(reqBody.position.z || 0)
+        );
+    }
+    if (reqBody.rotate && typeof reqBody.rotate === "object") {
+        var axis = String(reqBody.rotate.axis || "y").toLowerCase();
+        var angle = Number(reqBody.rotate.angle || 0);
+        if (axis === "x") obj.RotateX(angle);
+        else if (axis === "z") obj.RotateZ(angle);
+        else obj.RotateY(angle);
+    }
+
+    obj.Build();
+    Action.Commit();
+    if (reqBody.viewAll) ViewAll();
+
+    var newCount = safeGet(function () { return Model.Count; }, 0);
+    var created = newCount > prevCount ? safeGet(function () { return Model.Objects[newCount - 1]; }, null) : null;
+    return {
+        mode: mode,
+        object: created ? serializeObject(created, 0, 2) : null
+    };
+}
+
 function handleEval(body) {
     if (!body || typeof body.code !== "string") {
         throw new Error("Request body must contain string field 'code'");
@@ -3529,6 +3921,14 @@ function dispatchRequest(method, urlPath, query, body, transportLabel) {
                 return { status: 200, payload: { ok: true, result: handlePanelCut(reqBody) } };
             } else if (urlPath === "/panel/cutout") {
                 return { status: 200, payload: { ok: true, result: handlePanelCutout(reqBody) } };
+            } else if (urlPath === "/panel/contour") {
+                return { status: 200, payload: { ok: true, result: handlePanelEditContour(reqBody) } };
+            } else if (urlPath === "/panel/plastic") {
+                return { status: 200, payload: { ok: true, result: handlePanelPlastic(reqBody) } };
+            } else if (urlPath === "/object/edit") {
+                return { status: 200, payload: { ok: true, result: handleObjectEdit(reqBody) } };
+            } else if (urlPath === "/profile") {
+                return { status: 200, payload: { ok: true, result: handleCreateProfile(reqBody) } };
             } else if (urlPath === "/carcass") {
                 return { status: 200, payload: { ok: true, carcass: handleCreateCarcass(reqBody) } };
             } else if (urlPath === "/doors") {
