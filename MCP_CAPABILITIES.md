@@ -28,7 +28,7 @@
 - **UIDs:** Every object, block, and panel in Bazis has a stable integer `uid` returned by `bazis_get_model`, `bazis_get_bom`, and creation tools. Pass `uid` / `uids` / `carcassUid` to modify, band, groove, fasten, transform, or delete objects.
 - **File paths:** Bazis runs on Windows. Any tool taking `filename` (`bazis_scene_action`, `bazis_export`) expects a **Windows path**. To share exported files directly with macOS in Parallels, write to your shared folder path (e.g. `Z:\path\to\bazis-mcp-scripts\<name>`).
 
-## 3. MCP Tools Catalog (34 Tools)
+## 3. MCP Tools Catalog (35 Tools)
 
 ### A. Status, Inspection & BOM
 
@@ -117,6 +117,8 @@
     - Inserts/updates materials (`action: "upsert_material"`) or executes write SQL (`INSERT`/`UPDATE`/`DELETE`) in the Firebird 2.5 Materials Database, automatically creating a dated `.fdb.bak_YYYYMMDD` backup before writing unless `backup: false`.
 26. **`bazis_scene_action`** `{ action: "view_all"|"orient_camera"|"new_model"|"save_model"|"load_model"|"save_project"|"load_project"|"arrange_positions", filename?, dir?: { x, y, z }, mode?: 0|1|2 }`
     - Controls viewport (`view_all`, `orient_camera`), document lifecycle (`new_model`, `save_model`, `load_model`, `save_project`, `load_project`), and part position numbering (`arrange_positions`: `0=All, 1=New, 2=Check`).
+27. **`bazis_screenshot`** `{ target?: "bazis"|"screen", filename?, viewAll?, orientCamera?: "iso"|"front"|"back"|"left"|"right"|"top"|{x,y,z}, returnBase64? }`
+    - Captures a PNG screenshot of the live Bazis window (`target: "bazis"`, default) or full primary display (`target: "screen"`), optionally orienting the camera and fitting the view first, and returns a native MCP `image` content block (plus optional saved file path).
 27. **`bazis_export`** `{ format?: "bom_csv"|"bom_json"|"svg", filename, uid?, curveQuality?, groupElems? }`
     - Exports a panel's 2D contour as SVG (`uid` required) or the full model BOM as CSV/JSON to a Windows file path.
 

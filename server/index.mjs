@@ -1300,6 +1300,41 @@ const TOOLS = [
     },
   },
   {
+    name: "bazis_screenshot",
+    description:
+      "Capture a PNG screenshot of the live Bazis-Mebelshchik application window ('bazis', default) or full primary display ('screen'). Optionally calls ViewAll() or orients the 3D camera first, saves to a Windows file if filename is provided, and returns a native MCP image block so vision-capable clients see the 3D scene directly.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target: {
+          type: "string",
+          enum: ["bazis", "screen"],
+          description: "Capture target: 'bazis' main window (default) or 'screen' (full primary monitor).",
+        },
+        filename: {
+          type: "string",
+          description: "Optional Windows path to save the PNG file (e.g. 'Z:\\\\path\\\\shot.png').",
+        },
+        viewAll: { type: "boolean", description: "Call ViewAll() before capturing (default false)." },
+        orientCamera: {
+          description: "Optional camera preset ('iso', 'front', 'back', 'left', 'right', 'top') or {x, y, z} direction vector before capturing.",
+          oneOf: [
+            { type: "string", enum: ["iso", "front", "back", "left", "right", "top"] },
+            {
+              type: "object",
+              properties: { x: { type: "number" }, y: { type: "number" }, z: { type: "number" } },
+            },
+          ],
+        },
+        returnBase64: {
+          type: "boolean",
+          description: "Return PNG inline as an MCP image content block (default true).",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "bazis_eval",
     description:
       "Execute arbitrary JavaScript inside Bazis-Mebelshchik 2022 with full access to the Bazis API (Model, Action, ActiveMaterial, Undo, AddHorizPanel, AddVertPanel, AddFrontPanel, BeginBlock/EndBlock, etc.). Inside 'code', use 'log(...)' to capture output, 'params' for input parameters, and 'return ...' for the JSON-serializable return value. Note: calling Action.Commit() invalidates pre-commit JS handles to newly created objects—read committed objects back from Model after committing.",
@@ -1463,6 +1498,8 @@ async function executeTool(name, args) {
       return callBridge("POST", "/inspect", params);
     case "bazis_scene_action":
       return callBridge("POST", "/scene", params);
+    case "bazis_screenshot":
+      return callBridge("POST", "/screenshot", params);
     case "bazis_eval":
       return callBridge("POST", "/eval", params);
     default:
@@ -1535,14 +1572,33 @@ async function handleRequest(msg) {
     }
     try {
       const result = await executeTool(toolName, toolArgs);
-      sendResult(id, {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result, null, 2),
-          },
-        ],
-      });
+      if (toolName === "bazis_screenshot" && result && result.screenshot && result.screenshot.base64) {
+        const b64 = result.screenshot.base64;
+        const meta = Object.assign({}, result.screenshot);
+        delete meta.base64;
+        sendResult(id, {
+          content: [
+            {
+              type: "image",
+              data: b64,
+              mimeType: meta.mimeType || "image/png",
+            },
+            {
+              type: "text",
+              text: JSON.stringify({ ok: true, screenshot: meta }, null, 2),
+            },
+          ],
+        });
+      } else {
+        sendResult(id, {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        });
+      }
     } catch (err) {
       sendResult(id, {
         isError: true,

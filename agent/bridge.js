@@ -3702,6 +3702,104 @@ function handleCreateProfile(body) {
     };
 }
 
+function handleScreenshot(body) {
+    var reqBody = body || {};
+    var target = String(reqBody.target || "bazis").toLowerCase(); // bazis | screen
+    var returnBase64 = reqBody.returnBase64 !== false;
+
+    if (reqBody.orientCamera) {
+        var oc = reqBody.orientCamera;
+        var vec = null;
+        if (typeof oc === "string") {
+            var preset = oc.toLowerCase();
+            if (preset === "front") vec = NewVector(0, 0, -1);
+            else if (preset === "back") vec = NewVector(0, 0, 1);
+            else if (preset === "left") vec = NewVector(1, 0, 0);
+            else if (preset === "right") vec = NewVector(-1, 0, 0);
+            else if (preset === "top") vec = NewVector(0, -1, 0);
+            else if (preset === "iso") vec = NewVector(-1, -0.7, -1);
+        } else if (typeof oc === "object") {
+            vec = NewVector(Number(oc.x || 0), Number(oc.y || 0), Number(oc.z || -1));
+        }
+        if (vec) {
+            try { OrientCamera(vec); } catch (e) {}
+        }
+    }
+    if (reqBody.viewAll === true) {
+        try { ViewAll(); } catch (e) {}
+    }
+    if (reqBody.orientCamera || reqBody.viewAll === true) {
+        try { system.sleep(150); } catch (e) {}
+    }
+
+    var tmpDir = process.env.TEMP || "C:\\Windows\\Temp";
+    var tag = "bazis_shot_" + Date.now() + "_" + Math.floor(Math.random() * 10000);
+    var psFile = path.join(tmpDir, tag + ".ps1");
+    var isTempOut = !reqBody.filename;
+    var outFile = isTempOut ? path.join(tmpDir, tag + ".png") : path.resolve(String(reqBody.filename));
+    ensureDirRecursive(path.dirname(outFile));
+
+    var psLines = [
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "Add-Type -AssemblyName System.Drawing",
+        "Add-Type @\"",
+        "using System;",
+        "using System.Runtime.InteropServices;",
+        "public class BazisWin32Shot {",
+        "  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }",
+        "  [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);",
+        "}",
+        "\"@",
+        "$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds",
+        "$x = $bounds.X; $y = $bounds.Y; $w = $bounds.Width; $h = $bounds.Height"
+    ];
+    if (target !== "screen") {
+        psLines.push("$proc = Get-Process | Where-Object { $_.ProcessName -like \"Bazis*\" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1");
+        psLines.push("if ($proc) {");
+        psLines.push("  $r = New-Object BazisWin32Shot+RECT");
+        psLines.push("  if ([BazisWin32Shot]::GetWindowRect($proc.MainWindowHandle, [ref]$r)) {");
+        psLines.push("    $rw = $r.Right - $r.Left; $rh = $r.Bottom - $r.Top");
+        psLines.push("    if ($rw -gt 100 -and $rh -gt 100) { $x = $r.Left; $y = $r.Top; $w = $rw; $h = $rh }");
+        psLines.push("  }");
+        psLines.push("}");
+    }
+    psLines.push("$bmp = New-Object System.Drawing.Bitmap($w, $h)");
+    psLines.push("$g = [System.Drawing.Graphics]::FromImage($bmp)");
+    psLines.push("$g.CopyFromScreen($x, $y, 0, 0, $bmp.Size)");
+    psLines.push("$bmp.Save(\"" + outFile.replace(/\\/g, "\\\\") + "\", [System.Drawing.Imaging.ImageFormat]::Png)");
+    psLines.push("$g.Dispose(); $bmp.Dispose()");
+
+    fs.writeFileSync(psFile, psLines.join("\r\n"), "utf8");
+    try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch (e) {}
+
+    var sh = NewCOMObject("WScript.Shell");
+    var rc = sh.Run("powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"" + psFile + "\"", 0, true);
+    try { fs.unlinkSync(psFile); } catch (e) {}
+
+    if (!fs.existsSync(outFile)) {
+        throw new Error("Screenshot capture failed (rc=" + rc + ")");
+    }
+    var buf = fs.readFileSync(outFile);
+    var width = buf.length >= 24 ? buf.readUInt32BE(16) : null;
+    var height = buf.length >= 24 ? buf.readUInt32BE(20) : null;
+    var b64 = returnBase64 ? buf.toString("base64") : null;
+    if (isTempOut) {
+        try { fs.unlinkSync(outFile); } catch (e) {}
+    }
+
+    var res = {
+        captured: true,
+        target: target,
+        mimeType: "image/png",
+        width: width,
+        height: height,
+        sizeBytes: buf.length,
+        savedPath: isTempOut ? null : outFile
+    };
+    if (b64) res.base64 = b64;
+    return res;
+}
+
 function handleEval(body) {
     if (!body || typeof body.code !== "string") {
         throw new Error("Request body must contain string field 'code'");
@@ -3963,6 +4061,8 @@ function dispatchRequest(method, urlPath, query, body, transportLabel) {
                 return { status: 200, payload: { ok: true, inspection: handleInspect(reqBody) } };
             } else if (urlPath === "/scene") {
                 return { status: 200, payload: { ok: true, result: handleScene(reqBody) } };
+            } else if (urlPath === "/screenshot") {
+                return { status: 200, payload: { ok: true, screenshot: handleScreenshot(reqBody) } };
             } else if (urlPath === "/eval") {
                 var evalRes = handleEval(reqBody);
                 return { status: 200, payload: { ok: true, result: evalRes.result, logs: evalRes.logs } };

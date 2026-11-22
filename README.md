@@ -85,7 +85,7 @@ Set `BAZIS_BRIDGE_URL` and `BAZIS_BRIDGE_TOKEN` (copied from the Bazis Propertie
 }
 ```
 
-## Available MCP Tools (34)
+## Available MCP Tools (35)
 
 | Tool | Description |
 | --- | --- |
@@ -122,7 +122,8 @@ Set `BAZIS_BRIDGE_URL` and `BAZIS_BRIDGE_TOKEN` (copied from the Bazis Propertie
 | `bazis_transform_object` | Rename, toggle visibility, translate, or rotate an object/block by UID (with Undo) |
 | `bazis_check_model` | Run Bazis built-in `NewModelInspector` to find intersections & errors |
 | `bazis_scene_action` | `view_all`, `orient_camera`, `new_model`, `save_model`, `load_model`, `save_project`, `load_project`, `arrange_positions` |
-| `bazis_eval` | Execute arbitrary JavaScript inside Bazis 2022 with full API access |
+| `bazis_screenshot` | Capture a PNG screenshot of the Bazis window (`bazis`) or full display (`screen`) as a native MCP image block (optional camera preset / `viewAll` / save to file) |
+| `bazis_eval` | Execute arbitrary JavaScript inside Bazis 2022+ with full API access |
 
 ## CLI Shortcuts (macOS)
 
