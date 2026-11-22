@@ -164,7 +164,16 @@ function main() {
         return;
     }
 
-    // Step 2: Apply Order Name, Unit Names, Part Names, and Sequential Position Numbers
+    UnSelectAll();
+
+    // Step 2: Ask whether to assign sequential part positions (1..N) for cutting maps & CNC
+    var numberPartsSequentially = confirm(
+        "Assign sequential position numbers (1, 2, 3, ...) to all parts for cutting maps and CNC?\n\n" +
+        "Yes = assign sequential ArtPos (1..N) and include it in every part name.\n" +
+        "No  = keep existing part ArtPos values and update unit/order tags only."
+    );
+
+    // Step 3: Apply Order Name, Unit Names, Part Names, and optional Sequential Position Numbers
     try { Article.OrderName = orderName; } catch (e) {}
 
     var partPos = 1;
@@ -188,10 +197,16 @@ function main() {
         for (var pIdx = 0; pIdx < item.panels.length; pIdx++) {
             var panel = item.panels[pIdx];
             var baseName = cleanBasePartName(panel.Name);
-            // Part name format: <position number> <part name> <pos ###>, <order name>
-            panel.Name = partPos + " " + baseName + " " + item.posTag + ", " + orderName;
-            try { panel.ArtPos = String(partPos); } catch (e) {}
-            partPos++;
+            if (numberPartsSequentially) {
+                // Part name format: <position number> <part name> <pos ###>, <order name>
+                panel.Name = partPos + " " + baseName + " " + item.posTag + ", " + orderName;
+                try { panel.ArtPos = String(partPos); } catch (e) {}
+                partPos++;
+            } else {
+                var existingPos = "";
+                try { existingPos = String(panel.ArtPos || "").trim(); } catch (e) {}
+                panel.Name = (existingPos ? (existingPos + " ") : "") + baseName + " " + item.posTag + ", " + orderName;
+            }
             totalParts++;
         }
     }
@@ -202,8 +217,9 @@ function main() {
     alert(
         "Done!\n" +
         "Order: " + orderName + "\n" +
-        "Units numbered: " + assignments.length + "\n" +
-        "Parts numbered: " + totalParts
+        "Units updated: " + assignments.length + "\n" +
+        "Parts updated: " + totalParts + "\n" +
+        "Sequential part positions (CNC/cutting): " + (numberPartsSequentially ? "Yes (1.." + (partPos - 1) + ")" : "No (kept existing)")
     );
     Action.Finish();
 }
