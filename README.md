@@ -37,6 +37,7 @@ Open Bazis-Mebelshchik 2022+ → **Scripts** menu → run `bridge.js`.
 In the Bazis Properties panel you will see:
 - **MCP Bridge URL** (`http://127.0.0.1:18765 + Shared IPC`)
 - **Status** (`Listening (Shared IPC + ...)`)
+- **Reload MCP Bridge** button (hot-reloads the latest `bridge.js` from disk without restarting via the Scripts menu)
 - **Stop MCP Bridge** button (cleanly stops the bridge and removes `.bridge-endpoint.json`)
 
 ### 3. Verify from macOS

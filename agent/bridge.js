@@ -3918,7 +3918,68 @@ var statusProp = Action.Properties.NewString("Status");
 statusProp.Value = "Starting...";
 statusProp.Enabled = false;
 
+var reloadBtn = Action.Properties.NewButton("Reload MCP Bridge");
 var stopBtn = Action.Properties.NewButton("Stop MCP Bridge");
+
+function resolveBridgeScriptPath() {
+    var candidates = [
+        path.join(getBazisDocumentsRoot(), "Scripts", "bridge.js")
+    ];
+    if (typeof __filename === "string" && __filename) {
+        candidates.unshift(__filename);
+    }
+    for (var i = 0; i < candidates.length; i++) {
+        try {
+            if (fs.existsSync(candidates[i])) return candidates[i];
+        } catch (e) {}
+    }
+    return candidates[candidates.length - 1];
+}
+
+function reloadBridge() {
+    if (stopped) return;
+    stopped = true;
+    statusProp.Value = "Reloading...";
+    Action.Hint = "Reloading Bazis MCP Bridge...";
+    if (ipcTimer) {
+        try { clearInterval(ipcTimer); } catch (e) {}
+        ipcTimer = null;
+    }
+
+    var doExec = function () {
+        setTimeout(function () {
+            try {
+                var scriptPath = resolveBridgeScriptPath();
+                if (!fs.existsSync(scriptPath)) {
+                    alert("Reload failed: bridge.js not found at " + scriptPath);
+                    Action.Finish();
+                    return;
+                }
+                var code = fs.readFileSync(scriptPath, "utf8");
+                if (code.charCodeAt(0) === 0xFEFF) code = code.slice(1);
+                try { Action.Properties.Clear(); } catch (e) {}
+                var fn = new Function(code);
+                fn();
+            } catch (err) {
+                system.log("Bazis MCP bridge reload error: " + (err && err.stack ? err.stack : err));
+                alert("Bazis MCP bridge reload failed:\n" + (err && err.message ? err.message : String(err)));
+                Action.Finish();
+            }
+        }, 120);
+    };
+
+    if (server) {
+        var srv = server;
+        server = null;
+        try {
+            srv.close(doExec);
+        } catch (e) {
+            doExec();
+        }
+    } else {
+        doExec();
+    }
+}
 
 function shutdown(fromFinish) {
     if (stopped) return;
@@ -3943,6 +4004,10 @@ function shutdown(fromFinish) {
         Action.Finish();
     }
 }
+
+reloadBtn.OnClick = function () {
+    reloadBridge();
+};
 
 stopBtn.OnClick = function () {
     shutdown(false);
@@ -4066,6 +4131,9 @@ function dispatchRequest(method, urlPath, query, body, transportLabel) {
             } else if (urlPath === "/eval") {
                 var evalRes = handleEval(reqBody);
                 return { status: 200, payload: { ok: true, result: evalRes.result, logs: evalRes.logs } };
+            } else if (urlPath === "/reload") {
+                setTimeout(function () { reloadBridge(); }, 50);
+                return { status: 200, payload: { ok: true, reloading: true } };
             } else if (urlPath === "/stop") {
                 setTimeout(function () { shutdown(false); }, 50);
                 return { status: 200, payload: { ok: true, stopping: true } };
