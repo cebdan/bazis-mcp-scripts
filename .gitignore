@@ -1,0 +1,17 @@
+.bridge-endpoint.json
+.bridge-ipc/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log
+# Bazis & proprietary CAD/database files (never commit)
+*.b3d
+*.fr3d
+*.f3d
+*.bbb
+*.bdl
+*.fdb
+*.fdb.bak_*
+*.bxf
+*.bxf2
+docs/api/
