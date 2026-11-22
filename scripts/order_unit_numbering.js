@@ -10,8 +10,10 @@
 //      Also updates ArtPos on every part and unit, and Article.OrderName.
 
 // --- Configuration --------------------------------------------------------
-var POS_PREFIX = "pos ";        // Prefix for <pos ###>, e.g. "pos 001"
-var POS_PAD_DIGITS = 3;         // Zero-pad width for unit position (3 -> 001)
+var POS_PREFIX = "pos ";         // Prefix for <pos ###>, e.g. "pos 010"
+var POS_PAD_DIGITS = 3;          // Zero-pad width for unit position (3 -> 010)
+var POS_START = 10;              // Default position number for the first unit
+var POS_STEP = 10;               // Increment for each next suggested unit position (+10)
 var GLOBAL_PART_SEQUENCE = true; // true = 1..N across entire order; false = restart at 1 per unit
 // --------------------------------------------------------------------------
 
@@ -112,6 +114,7 @@ function main() {
 
     // Step 1: Highlight each unit in 3D and ask for its unit position
     var assignments = [];
+    var nextPosNum = POS_START;
     for (var i = 0; i < units.length; i++) {
         var u = units[i];
         var unitObj = u.obj;
@@ -121,7 +124,7 @@ function main() {
         UnSelectAll();
         try { unitObj.Selected = true; } catch (e) {}
 
-        var suggested = padNumber(i + 1, POS_PAD_DIGITS);
+        var suggested = padNumber(nextPosNum, POS_PAD_DIGITS);
         var msg =
             "Unit " + (i + 1) + " of " + units.length + " (" + origName + ", " + u.panels.length + " parts)\n" +
             "Enter unit position number (default: " + suggested + ", type 'skip' to skip, Cancel to abort):";
@@ -135,7 +138,17 @@ function main() {
         if (trimmed.toLowerCase() === "skip") {
             continue;
         }
-        var posTag = formatPosTag(trimmed || suggested);
+        var chosenRaw = trimmed || suggested;
+        var posTag = formatPosTag(chosenRaw);
+
+        // Advance next suggested position by +POS_STEP (10) from the entered/chosen number
+        var numMatch = chosenRaw.match(/(\d+)/);
+        if (numMatch) {
+            nextPosNum = parseInt(numMatch[1], 10) + POS_STEP;
+        } else {
+            nextPosNum += POS_STEP;
+        }
+
         assignments.push({
             obj: unitObj,
             panels: u.panels,
