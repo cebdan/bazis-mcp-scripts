@@ -4229,24 +4229,62 @@ server = http.createServer(function (req, res) {
     sendJson(res, out.status, out.payload);
 });
 
+var listenRetries = 0;
+var MAX_LISTEN_RETRIES = 4;
+
+function stopPreviousInstance(onDone) {
+    try {
+        var req = http.request({
+            hostname: "127.0.0.1",
+            port: PORT,
+            path: "/stop",
+            method: "POST",
+            headers: { "Content-Type": "application/json", "Content-Length": 2 },
+            timeout: 1500
+        }, function (res) {
+            res.resume();
+            res.on("end", function () { setTimeout(onDone, 250); });
+        });
+        req.on("error", function () { setTimeout(onDone, 250); });
+        req.on("timeout", function () { try { req.destroy(); } catch (e) {} setTimeout(onDone, 250); });
+        req.write("{}");
+        req.end();
+    } catch (e) {
+        setTimeout(onDone, 250);
+    }
+}
+
+function startListening() {
+    server.listen(PORT, HOST, function () {
+        advertisedUrls = buildAdvertisedUrls();
+        var ipcReady = initIpcDir();
+        if (ipcReady) {
+            ipcTimer = setInterval(pollIpcDir, IPC_POLL_MS);
+        }
+        urlProp.Value = (advertisedUrls[0] || ("http://" + HOST + ":" + PORT)) + (ipcReady ? " + Shared IPC" : "");
+        writeEndpointFiles(advertisedUrls);
+        statusProp.Value = "Listening (" + (ipcReady ? "Shared IPC + " : "") + advertisedUrls.join(", ") + ")";
+        Action.Hint = "Bazis MCP Bridge ready (" + urlProp.Value + ")";
+        system.log("Bazis MCP bridge listening on " + advertisedUrls.join(", ") + (ipcReady ? " + IPC " + IPC_DIR : ""));
+    });
+}
+
 server.on("error", function (err) {
+    if (err && err.code === "EADDRINUSE" && listenRetries < MAX_LISTEN_RETRIES) {
+        listenRetries++;
+        statusProp.Value = "Restarting existing bridge (" + listenRetries + "/" + MAX_LISTEN_RETRIES + ")...";
+        system.log("Bazis MCP bridge: port " + PORT + " already in use, stopping previous instance (attempt " + listenRetries + ")...");
+        stopPreviousInstance(function () {
+            if (!stopped) startListening();
+        });
+        return;
+    }
     statusProp.Value = "Error: " + err.message;
     system.log("Bazis MCP bridge server error: " + err.message);
     alert("Bazis MCP bridge failed to start on " + HOST + ":" + PORT + "\n" + err.message);
     shutdown(false);
 });
 
-server.listen(PORT, HOST, function () {
-    advertisedUrls = buildAdvertisedUrls();
-    var ipcReady = initIpcDir();
-    if (ipcReady) {
-        ipcTimer = setInterval(pollIpcDir, IPC_POLL_MS);
-    }
-    urlProp.Value = (advertisedUrls[0] || ("http://" + HOST + ":" + PORT)) + (ipcReady ? " + Shared IPC" : "");
-    writeEndpointFiles(advertisedUrls);
-    statusProp.Value = "Listening (" + (ipcReady ? "Shared IPC + " : "") + advertisedUrls.join(", ") + ")";
-    Action.Hint = "Bazis MCP Bridge ready (" + urlProp.Value + ")";
-    system.log("Bazis MCP bridge listening on " + advertisedUrls.join(", ") + (ipcReady ? " + IPC " + IPC_DIR : ""));
-});
+startListening();
 
 Action.Continue();
