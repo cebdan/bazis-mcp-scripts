@@ -8,8 +8,9 @@ var os = require("os");
 var fs = require("fs");
 var path = require("path");
 
+var DEFAULT_PORT = 18765;
 var HOST = getEnv("BAZIS_BRIDGE_HOST", "127.0.0.1");
-var PORT = Number(getEnv("BAZIS_BRIDGE_PORT", "18765"));
+var PORT = Number(getEnv("BAZIS_BRIDGE_PORT", String(DEFAULT_PORT)));
 var NO_AUTH = getEnv("BAZIS_BRIDGE_NO_AUTH", "") === "1";
 var TOKEN = getEnv("BAZIS_BRIDGE_TOKEN", "") || generateToken();
 var ENDPOINT_FILES = resolveEndpointFiles();
@@ -3918,8 +3919,49 @@ var statusProp = Action.Properties.NewString("Status");
 statusProp.Value = "Starting...";
 statusProp.Enabled = false;
 
+var portProp = Action.Properties.NewNumber("Bridge Port");
+portProp.Value = PORT;
+
+var changePortBtn = Action.Properties.NewButton("Change Port & Reload");
 var reloadBtn = Action.Properties.NewButton("Reload MCP Bridge");
 var stopBtn = Action.Properties.NewButton("Stop MCP Bridge");
+
+function savePortAndReload() {
+    var desired = Math.floor(Number(portProp.Value || 0));
+    if (!desired || desired === PORT) {
+        var raw = prompt("Enter new MCP Bridge Port (1024-65535, current: " + PORT + "):");
+        if (raw === null || raw === undefined) return;
+        desired = Math.floor(Number(String(raw).trim()));
+    }
+    if (!isFinite(desired) || desired < 1024 || desired > 65535) {
+        alert("Invalid port number. Please enter an integer between 1024 and 65535.");
+        portProp.Value = PORT;
+        return;
+    }
+
+    var scriptPath = resolveBridgeScriptPath();
+    if (!fs.existsSync(scriptPath)) {
+        alert("Cannot save port: bridge.js not found at " + scriptPath);
+        return;
+    }
+    try {
+        var code = fs.readFileSync(scriptPath, "utf8");
+        var updated = code.replace(/var\s+DEFAULT_PORT\s*=\s*\d+\s*;/, "var DEFAULT_PORT = " + desired + ";");
+        if (updated === code && desired !== DEFAULT_PORT) {
+            alert("Could not find DEFAULT_PORT declaration in " + scriptPath);
+            return;
+        }
+        fs.writeFileSync(scriptPath, updated, "utf8");
+        if (typeof process !== "undefined" && process.env && process.env.BAZIS_BRIDGE_PORT) {
+            process.env.BAZIS_BRIDGE_PORT = String(desired);
+        }
+        portProp.Value = desired;
+        statusProp.Value = "Port saved (" + desired + "), reloading...";
+        reloadBridge();
+    } catch (e) {
+        alert("Failed to save port to bridge.js:\n" + (e && e.message ? e.message : String(e)));
+    }
+}
 
 function resolveBridgeScriptPath() {
     var candidates = [
@@ -4004,6 +4046,10 @@ function shutdown(fromFinish) {
         Action.Finish();
     }
 }
+
+changePortBtn.OnClick = function () {
+    savePortAndReload();
+};
 
 reloadBtn.OnClick = function () {
     reloadBridge();
