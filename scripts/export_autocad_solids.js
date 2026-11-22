@@ -14,6 +14,8 @@
 // --- Configuration --------------------------------------------------------
 var SWAP_YZ_FOR_AUTOCAD = true;   // true = Bazis (X, Y-up, Z) -> AutoCAD (X, Z, Y-up)
 var LAYER_MODE = "material";      // "material" | "unit"
+var SUBTRACT_HOLES = true;        // true = subtract true ACIS cylinders (_CYLINDER) for all fastener holes
+var SUBTRACT_GROOVES = true;      // true = subtract true ACIS boxes for all panel grooves (panel.Cuts)
 var DECIMAL_PLACES = 3;           // Coordinate precision in mm
 var SET_SHADED_VIEW = true;       // Switch AutoCAD viewport to Shaded + Zoom Extents at end
 // --------------------------------------------------------------------------
@@ -262,6 +264,172 @@ function emitShapedPanelSolid(panel, lines) {
     return true;
 }
 
+// Extract all fastener drilling holes that intersect the panel and return
+// AutoCAD 3D cylinder endpoints (pStart, pEnd, radius) for exact _SUBTRACT.
+function extractPanelDrillCylinders(panel) {
+    var out = [];
+    var contour = safeGet(function () { return panel.Contour; }, null);
+    if (!contour) return out;
+    var cMin = safeGet(function () { return contour.Min; }, { x: 0, y: 0 });
+    var cMax = safeGet(function () { return contour.Max; }, { x: 0, y: 0 });
+    var L = Math.abs(cMax.x - cMin.x);
+    var B = Math.abs(cMax.y - cMin.y);
+    var T = Number(safeGet(function () { return panel.Thickness; }, 16));
+    if (L <= 0 || B <= 0 || T <= 0) return out;
+
+    var fasteners = safeGet(function () { return panel.FindConnectedFasteners(); }, null);
+    if (!fasteners || !fasteners.length) return out;
+
+    var seen = {};
+    for (var fi = 0; fi < fasteners.length; fi++) {
+        var f = fasteners[fi];
+        if (!f) continue;
+        var holes = safeGet(function () { return f.Holes; }, null);
+        if (!holes) continue;
+        var hCount = safeGet(function () { return holes.Count; }, 0);
+
+        for (var hi = 0; hi < hCount; hi++) {
+            var h = safeGet(function () { return holes[hi]; }, null);
+            if (!h) continue;
+            var diam = Number(safeGet(function () { return h.Diameter; }, 0));
+            var rawDepth = Number(safeGet(function () { return h.Depth; }, 0));
+            if (diam <= 0.2 || rawDepth <= 0.2) continue;
+
+            var localPos = safeGet(function () { return h.Position; }, null);
+            var localDir = safeGet(function () { return h.Direction; }, null);
+            if (!localPos || !localDir) continue;
+
+            var gPos = safeGet(function () { return f.ToGlobal(localPos); }, null);
+            var gDir = safeGet(function () { return f.NToGlobal(localDir); }, null);
+            if (!gPos || !gDir) continue;
+
+            var pPos = safeGet(function () { return panel.ToObject(gPos); }, null);
+            var pDir = safeGet(function () { return panel.NToObject(gDir); }, null);
+            if (!pPos || !pDir) continue;
+
+            var dLen = Math.sqrt(pDir.x * pDir.x + pDir.y * pDir.y + pDir.z * pDir.z);
+            if (dLen < 1e-6) continue;
+            var dx = pDir.x / dLen, dy = pDir.y / dLen, dz = pDir.z / dLen;
+
+            var tol = 1.0;
+            var tMin = 0;
+            var tMax = rawDepth;
+
+            function clip(s, d, lo, hi) {
+                if (Math.abs(d) < 1e-6) return s >= lo - tol && s <= hi + tol;
+                var t1 = (lo - s) / d;
+                var t2 = (hi - s) / d;
+                if (t1 > t2) { var tmp = t1; t1 = t2; t2 = tmp; }
+                if (t1 > tMin) tMin = t1;
+                if (t2 < tMax) tMax = t2;
+                return tMin <= tMax;
+            }
+
+            if (!clip(pPos.x, dx, cMin.x, cMax.x)) continue;
+            if (!clip(pPos.y, dy, cMin.y, cMax.y)) continue;
+            if (!clip(pPos.z, dz, 0, T)) continue;
+
+            var effDepth = tMax - tMin;
+            if (effDepth < 0.5) continue;
+
+            // Extend entry end slightly (-0.5mm) and exit end if through-hole (+0.5mm)
+            // so ACIS boolean _SUBTRACT has clean non-coplanar faces.
+            var isThrough = (tMax >= rawDepth - 0.1) || (effDepth >= T - 0.5);
+            var extStart = tMin - 0.5;
+            var extEnd = isThrough ? (tMax + 0.5) : tMax;
+
+            var locStart = NewVector(pPos.x + dx * extStart, pPos.y + dy * extStart, pPos.z + dz * extStart);
+            var locEnd = NewVector(pPos.x + dx * extEnd, pPos.y + dy * extEnd, pPos.z + dz * extEnd);
+            var wStart = toAcadPt(panel.ToGlobal(locStart));
+            var wEnd = toAcadPt(panel.ToGlobal(locEnd));
+
+            var key = [
+                Math.round(wStart.x * 10), Math.round(wStart.y * 10), Math.round(wStart.z * 10),
+                Math.round(wEnd.x * 10), Math.round(wEnd.y * 10), Math.round(wEnd.z * 10),
+                Math.round(diam * 10)
+            ].join("|");
+            if (seen[key]) continue;
+            seen[key] = true;
+
+            out.push({ start: wStart, end: wEnd, radius: diam / 2 });
+        }
+    }
+    return out;
+}
+
+// Subtract straight panel grooves (panel.Cuts) as exact ACIS 3DSOLID boxes.
+function emitPanelGrooveSubtracts(panel, lines) {
+    var cuts = safeGet(function () { return panel.Cuts; }, null);
+    if (!cuts) return 0;
+    var count = safeGet(function () { return cuts.Count; }, 0);
+    if (count <= 0) return 0;
+
+    var T = Number(safeGet(function () { return panel.Thickness; }, 16));
+    var o0 = toAcadPt(panel.ToGlobal(NewVector(0, 0, 0)));
+    var ox = toAcadPt(panel.ToGlobal(NewVector(100, 0, 0)));
+    var oy = toAcadPt(panel.ToGlobal(NewVector(0, 100, 0)));
+    var oz = toAcadPt(panel.ToGlobal(NewVector(0, 0, T)));
+    var vx = { x: ox.x - o0.x, y: ox.y - o0.y, z: ox.z - o0.z };
+    var vy = { x: oy.x - o0.x, y: oy.y - o0.y, z: oy.z - o0.z };
+    var vz = { x: oz.x - o0.x, y: oz.y - o0.y, z: oz.z - o0.z };
+    var cross = { x: vx.y * vy.z - vx.z * vy.y, y: vx.z * vy.x - vx.x * vy.z, z: vx.x * vy.y - vx.y * vy.x };
+    var zSign = (cross.x * vz.x + cross.y * vz.y + cross.z * vz.z) >= 0 ? 1 : -1;
+
+    var subtracted = 0;
+    lines.push("_UCS _3 " + ptStr(o0) + " " + ptStr(ox) + " " + ptStr(oy));
+
+    for (var i = 0; i < count; i++) {
+        var cut = safeGet(function () { return cuts[i]; }, null);
+        if (!cut) continue;
+        var front = safeGet(function () { return cut.FrontSide !== false; }, true);
+        var traj = safeGet(function () { return cut.Trajectory; }, null);
+        var prof = safeGet(function () { return cut.Contour; }, null);
+        if (!traj) continue;
+
+        var gW = 4, gD = 8;
+        if (prof) {
+            var pMin = safeGet(function () { return prof.Min; }, null);
+            var pMax = safeGet(function () { return prof.Max; }, null);
+            if (pMin && pMax) {
+                if (Math.abs(pMax.x - pMin.x) > 0.1) gW = Math.abs(pMax.x - pMin.x);
+                if (Math.abs(pMax.y - pMin.y) > 0.1) gD = Math.abs(pMax.y - pMin.y);
+            }
+        }
+
+        var tCount = safeGet(function () { return traj.Count; }, 0);
+        for (var j = 0; j < tCount; j++) {
+            var el = safeGet(function () { return traj.Objects[j]; }, null);
+            var p1 = el ? safeGet(function () { return el.Pos1; }, null) : null;
+            var p2 = el ? safeGet(function () { return el.Pos2; }, null) : null;
+            if (!p1 || !p2) continue;
+
+            var dx = p2.x - p1.x, dy = p2.y - p1.y;
+            var len = Math.sqrt(dx * dx + dy * dy);
+            if (len < 0.5) continue;
+            var nx = (-dy / len) * (gW / 2);
+            var ny = (dx / len) * (gW / 2);
+
+            var z1 = front ? ((T - gD) * zSign) : (-0.5 * zSign);
+            var z2 = front ? ((T + 0.5) * zSign) : (gD * zSign);
+            var h = z2 - z1;
+
+            lines.push(
+                "_PLINE " +
+                fmt(p1.x + nx) + "," + fmt(p1.y + ny) + "," + fmt(z1) + " " +
+                fmt(p2.x + nx) + "," + fmt(p2.y + ny) + "," + fmt(z1) + " " +
+                fmt(p2.x - nx) + "," + fmt(p2.y - ny) + "," + fmt(z1) + " " +
+                fmt(p1.x - nx) + "," + fmt(p1.y - ny) + "," + fmt(z1) + " _C"
+            );
+            lines.push("_EXTRUDE _L  " + fmt(h));
+            lines.push("(command \"_SUBTRACT\" _bazis_panel \"\" (entlast) \"\")");
+            subtracted++;
+        }
+    }
+
+    lines.push("_UCS _W");
+    return subtracted;
+}
+
 function main() {
     var collected = [];
     for (var i = 0; i < Model.Count; i++) {
@@ -302,6 +470,8 @@ function main() {
     var currentLayer = "";
     var boxCount = 0;
     var shapedCount = 0;
+    var holesSubtracted = 0;
+    var groovesSubtracted = 0;
 
     for (var k = 0; k < collected.length; k++) {
         var panel = collected[k].panel;
@@ -328,6 +498,7 @@ function main() {
         var pPos = safeGet(function () { return String(panel.ArtPos || ""); }, "");
         lines.push("; Part: " + (pPos ? ("[" + pPos + "] ") : "") + pName);
 
+        var createdSolid = false;
         if (isAxisAlignedRectPanel(panel)) {
             var mn = toAcadPt(panel.GabMin);
             var mx = toAcadPt(panel.GabMax);
@@ -335,9 +506,28 @@ function main() {
             var pMax = { x: Math.max(mn.x, mx.x), y: Math.max(mn.y, mx.y), z: Math.max(mn.z, mx.z) };
             lines.push("_BOX " + ptStr(pMin) + " " + ptStr(pMax));
             boxCount++;
+            createdSolid = true;
         } else {
             if (emitShapedPanelSolid(panel, lines)) {
                 shapedCount++;
+                createdSolid = true;
+            }
+        }
+
+        if (createdSolid) {
+            var cyls = SUBTRACT_HOLES ? extractPanelDrillCylinders(panel) : [];
+            var hasGrooves = SUBTRACT_GROOVES && safeGet(function () { return panel.Cuts && panel.Cuts.Count > 0; }, false);
+            if (cyls.length > 0 || hasGrooves) {
+                lines.push("(setq _bazis_panel (entlast))");
+                for (var hi = 0; hi < cyls.length; hi++) {
+                    var cy = cyls[hi];
+                    lines.push("_CYLINDER " + ptStr(cy.start) + " " + fmt(cy.radius) + " _A " + ptStr(cy.end));
+                    lines.push("(command \"_SUBTRACT\" _bazis_panel \"\" (entlast) \"\")");
+                    holesSubtracted++;
+                }
+                if (hasGrooves) {
+                    groovesSubtracted += emitPanelGrooveSubtracts(panel, lines);
+                }
             }
         }
     }
@@ -359,6 +549,8 @@ function main() {
         "AutoCAD 3DSOLID (.scr) export complete!\n" +
         "File: " + outPath + "\n" +
         "Total 3D Solids: " + (boxCount + shapedCount) + " (" + boxCount + " box solids, " + shapedCount + " extruded/shaped solids)\n" +
+        "Drilling holes subtracted: " + holesSubtracted + "\n" +
+        "Grooves subtracted: " + groovesSubtracted + "\n" +
         "Layers created: " + Object.keys(layerColors).length + "\n\n" +
         "In AutoCAD: run SCRIPT and select this .scr file (or drag-and-drop it into AutoCAD)."
     );
