@@ -1,0 +1,89 @@
+{
+  "machine": "HOMAG / Weeke BHX 055",
+  "woodWopVersion": "6.0.0",
+  "mprHeaderVersion": "4.0 Alpha",
+  "flipAxisForBack": "X",
+  "throughToleranceMm": 0.5,
+  "skipNonCnc": true,
+  "workpieceLimits": {
+    "minLength": 200,
+    "maxLength": 3050,
+    "minWidth": 70,
+    "maxWidth": 850,
+    "minThickness": 12,
+    "maxThickness": 60
+  },
+  "tools": {
+    "router": {
+      "toolNo": "101",
+      "diameter": 12,
+      "feedRate": "STANDARD",
+      "spindleSpeed": "STANDARD",
+      "description": "Main routing spindle (replace toolNo with your BHX 055 tool number)"
+    },
+    "groovingSaw": {
+      "toolNo": "200",
+      "kerfWidth": 4.0,
+      "direction": "X",
+      "feedRate": "STANDARD",
+      "description": "Grooving saw in X direction (replace toolNo with your BHX 055 saw number)"
+    },
+    "verticalDrills": [
+      { "diameter": 5, "toolNo": "", "maxDepth": 35, "description": "System 32 shelf/runner drill D5" },
+      { "diameter": 8, "toolNo": "", "maxDepth": 35, "description": "Dowel drill D8" },
+      { "diameter": 10, "toolNo": "", "maxDepth": 35, "description": "Drill D10" },
+      { "diameter": 15, "toolNo": "", "maxDepth": 16, "description": "Cam lock (Minifix/Rastex) D15" },
+      { "diameter": 35, "toolNo": "", "maxDepth": 15, "description": "Hinge cup drill D35" }
+    ],
+    "horizontalDrills": [
+      { "diameter": 5, "directions": ["XP", "XM", "YP", "YM"], "toolNo": "", "maxDepth": 38, "description": "Horizontal drill D5" },
+      { "diameter": 8, "directions": ["XP", "XM", "YP", "YM"], "toolNo": "", "maxDepth": 38, "description": "Horizontal dowel drill D8" }
+    ]
+  },
+  "macros": {
+    "verticalDrill": {
+      "id": 102,
+      "name": "BohrVert",
+      "defaultBM": "LS",
+      "throughBM": "LSL",
+      "wwSpindles": "60,61,62,86,87,88,90,91,92,148,149,150,191,192",
+      "asg": "2"
+    },
+    "horizontalDrill": {
+      "id": 103,
+      "name": "BohrHoriz",
+      "asg": "2"
+    },
+    "groove": {
+      "id": 109,
+      "name": "Nuten",
+      "rk": "NOWRK",
+      "em": "MOD0",
+      "ml": "AUTO",
+      "bm": "LS",
+      "useRouterForYGrooves": true
+    },
+    "contourMill": {
+      "id": 105,
+      "name": "Konturfraesen",
+      "rk": "WRKL",
+      "mda": "SEN",
+      "mde": "SEN_AB",
+      "ri": "1"
+    },
+    "customComponents": {
+      "hinge_cup_35": {
+        "enabled": false,
+        "macroFile": "ml4\\topf35.mpr",
+        "description": "Optional woodWOP component macro for 35mm hinge cup",
+        "params": {}
+      },
+      "minifix_15": {
+        "enabled": false,
+        "macroFile": "ml4\\minifix15.mpr",
+        "description": "Optional woodWOP component macro for 15mm cam lock",
+        "params": {}
+      }
+    }
+  }
+}

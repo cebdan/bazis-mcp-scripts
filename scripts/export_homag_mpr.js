@@ -10,13 +10,71 @@
 // File naming uses each panel's ArtPos (if assigned) + sanitized panel name:
 //   e.g. "001_Left_Side_pos_010.mpr" (and "001_Left_Side_pos_010_B.mpr" if back-face ops exist).
 
-// --- Configuration --------------------------------------------------------
-var FLIP_AXIS_FOR_BACK = "X";   // "X" (flip around X -> mirrors Y) or "Y" (flip around Y -> mirrors X)
-var MILLING_TOOL_NO = "101";    // Default router tool number for <105 \Konturfraesen\>
-var MILLING_TOOL_RADIUS = 6;    // Router bit radius in mm (for reference)
-var SAW_TOOL_NO = "200";        // Default grooving saw tool number
-var THROUGH_TOLERANCE = 0.5;    // mm tolerance to classify a vertical hole as through-hole
-var SKIP_NON_CNC = true;        // Skip panels where panel.UseInCNC === false
+// --- Configuration (auto-loaded from homag_bhx055_config.json if present) -
+var DEFAULT_CONFIG = {
+    machine: "HOMAG / Weeke BHX 055",
+    woodWopVersion: "6.0.0",
+    mprHeaderVersion: "4.0 Alpha",
+    flipAxisForBack: "X",
+    throughToleranceMm: 0.5,
+    skipNonCnc: true,
+    workpieceLimits: { minLength: 200, maxLength: 3050, minWidth: 70, maxWidth: 850, minThickness: 12, maxThickness: 60 },
+    tools: {
+        router: { toolNo: "101", diameter: 12, feedRate: "STANDARD", spindleSpeed: "STANDARD" },
+        groovingSaw: { toolNo: "200", kerfWidth: 4.0, direction: "X", feedRate: "STANDARD" },
+        verticalDrills: [],
+        horizontalDrills: []
+    },
+    macros: {
+        verticalDrill: { id: 102, name: "BohrVert", defaultBM: "LS", throughBM: "LSL", wwSpindles: "60,61,62,86,87,88,90,91,92,148,149,150,191,192", asg: "2" },
+        horizontalDrill: { id: 103, name: "BohrHoriz", asg: "2" },
+        groove: { id: 109, name: "Nuten", rk: "NOWRK", em: "MOD0", ml: "AUTO", bm: "LS", useRouterForYGrooves: true },
+        contourMill: { id: 105, name: "Konturfraesen", rk: "WRKL", mda: "SEN", mde: "SEN_AB", ri: "1" },
+        customComponents: {}
+    }
+};
+
+function loadMachineConfig() {
+    var cfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+    try {
+        var path = require("path");
+        var os = require("os");
+        var candidates = [];
+        if (typeof __dirname !== "undefined") candidates.push(path.join(__dirname, "homag_bhx055_config.json"));
+        var home = os.homedir ? os.homedir() : "";
+        if (home) candidates.push(path.join(home, "Documents", "Bazis", "Scripts", "homag_bhx055_config.json"));
+        candidates.push("Z:\\Documents\\Claude\\bazis-mcp\\scripts\\homag_bhx055_config.json");
+
+        for (var i = 0; i < candidates.length; i++) {
+            if (fs.existsSync(candidates[i])) {
+                var parsed = JSON.parse(fs.readFileSync(candidates[i], "utf8"));
+                if (parsed && typeof parsed === "object") {
+                    for (var k in parsed) {
+                        if (k === "tools" && parsed.tools) {
+                            for (var tk in parsed.tools) cfg.tools[tk] = parsed.tools[tk];
+                        } else if (k === "macros" && parsed.macros) {
+                            for (var mk in parsed.macros) cfg.macros[mk] = parsed.macros[mk];
+                        } else if (k === "workpieceLimits" && parsed.workpieceLimits) {
+                            for (var wk in parsed.workpieceLimits) cfg.workpieceLimits[wk] = parsed.workpieceLimits[wk];
+                        } else {
+                            cfg[k] = parsed[k];
+                        }
+                    }
+                    cfg._loadedFrom = candidates[i];
+                    break;
+                }
+            }
+        }
+    } catch (e) {}
+    return cfg;
+}
+
+var CFG = loadMachineConfig();
+var FLIP_AXIS_FOR_BACK = String(CFG.flipAxisForBack || "X").toUpperCase();
+var MILLING_TOOL_NO = String((CFG.tools.router && CFG.tools.router.toolNo) || "101");
+var SAW_TOOL_NO = String((CFG.tools.groovingSaw && CFG.tools.groovingSaw.toolNo) || "200");
+var THROUGH_TOLERANCE = Number(CFG.throughToleranceMm !== undefined ? CFG.throughToleranceMm : 0.5);
+var SKIP_NON_CNC = CFG.skipNonCnc !== false;
 // --------------------------------------------------------------------------
 
 function safeGet(fn, fallback) {
@@ -512,6 +570,8 @@ function main() {
     var totalVert = 0;
     var totalHoriz = 0;
     var totalGrooves = 0;
+    var limitWarnings = [];
+    var lim = CFG.workpieceLimits || {};
 
     for (var pIdx = 0; pIdx < panels.length; pIdx++) {
         var panel = panels[pIdx];
@@ -524,6 +584,15 @@ function main() {
         var B = Math.abs(cMax.y - cMin.y);
         var T = Number(safeGet(function () { return panel.Thickness; }, 16));
         if (L <= 1 || B <= 1 || T <= 0) continue;
+
+        if ((lim.maxLength && L > lim.maxLength) || (lim.maxWidth && B > lim.maxWidth) ||
+            (lim.minLength && L < lim.minLength) || (lim.minWidth && B < lim.minWidth) ||
+            (lim.maxThickness && T > lim.maxThickness) || (lim.minThickness && T < lim.minThickness)) {
+            limitWarnings.push(
+                safeGet(function () { return String(panel.Name || ("Part_" + (pIdx + 1))); }, "Part") +
+                " (" + fmt(L) + "x" + fmt(B) + "x" + fmt(T) + " mm)"
+            );
+        }
 
         var holes = extractPanelHoles(panel, cMin, L, B, T);
         var grooves = extractPanelGrooves(panel, cMin);
@@ -585,11 +654,17 @@ function main() {
         }
     }
 
+    var warnText = limitWarnings.length > 0
+        ? ("\n\nWARNING (" + limitWarnings.length + " part(s) outside " + CFG.machine + " envelope):\n- " + limitWarnings.slice(0, 6).join("\n- "))
+        : "";
+
     alert(
-        "HOMAG woodWOP (.mpr) export complete!\n" +
+        CFG.machine + " (.mpr) export complete!\n" +
+        "Config: " + (CFG._loadedFrom || "(built-in defaults)") + "\n" +
         "Folder: " + outDir + "\n" +
         "Files written: " + exportedFiles + " (" + panels.length + " panels)\n" +
-        "Operations: " + totalVert + " vertical holes, " + totalHoriz + " edge holes, " + totalGrooves + " grooves"
+        "Operations: " + totalVert + " vertical holes, " + totalHoriz + " edge holes, " + totalGrooves + " grooves" +
+        warnText
     );
     Action.Finish();
 }
