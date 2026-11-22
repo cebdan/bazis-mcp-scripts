@@ -17,6 +17,8 @@ var DEFAULT_CONFIG = {
     mprHeaderVersion: "4.0 Alpha",
     flipAxisForBack: "X",
     throughToleranceMm: 0.5,
+    mergeThroughHolesToSingleSide: true,
+    requireArtPos: true,
     skipNonCnc: true,
     workpieceLimits: { minLength: 200, maxLength: 3050, minWidth: 70, maxWidth: 850, minThickness: 12, maxThickness: 60 },
     tools: {
@@ -74,6 +76,8 @@ var FLIP_AXIS_FOR_BACK = String(CFG.flipAxisForBack || "X").toUpperCase();
 var MILLING_TOOL_NO = String((CFG.tools.router && CFG.tools.router.toolNo) || "101");
 var SAW_TOOL_NO = String((CFG.tools.groovingSaw && CFG.tools.groovingSaw.toolNo) || "200");
 var THROUGH_TOLERANCE = Number(CFG.throughToleranceMm !== undefined ? CFG.throughToleranceMm : 0.5);
+var MERGE_THROUGH_TO_SINGLE_SIDE = CFG.mergeThroughHolesToSingleSide !== false;
+var REQUIRE_ART_POS = CFG.requireArtPos !== false;
 var SKIP_NON_CNC = CFG.skipNonCnc !== false;
 // --------------------------------------------------------------------------
 
@@ -553,6 +557,27 @@ function main() {
         return;
     }
 
+    // Check that all CNC panels have position numbers (ArtPos) before exporting
+    if (REQUIRE_ART_POS) {
+        var missingPos = [];
+        for (var mp = 0; mp < panels.length; mp++) {
+            var ap = safeGet(function () { return String(panels[mp].ArtPos || "").trim(); }, "");
+            if (!ap) {
+                missingPos.push(safeGet(function () { return String(panels[mp].Name || ("Panel #" + (mp + 1))); }, "Panel"));
+            }
+        }
+        if (missingPos.length > 0) {
+            alert(
+                "Export cancelled: " + missingPos.length + " of " + panels.length + " panel(s) have no position number (ArtPos).\n\n" +
+                "Please assign part positions first (e.g. via order_unit_numbering.js or 'Arrange Positions') and re-run the export.\n\n" +
+                "Missing positions:\n- " + missingPos.slice(0, 10).join("\n- ") +
+                (missingPos.length > 10 ? ("\n... and " + (missingPos.length - 10) + " more") : "")
+            );
+            Action.Finish();
+            return;
+        }
+    }
+
     // Ask user for a target directory by picking any filename inside that folder
     var samplePath = system.askFileNameSave("mpr");
     if (!samplePath) {
@@ -617,40 +642,85 @@ function main() {
             }
         }
 
+        // Optional optimization: move through-holes onto the same side as blind holes
+        // to eliminate unnecessary panel flips on single-side CNC machines (BHX 055).
+        var sideASingleFlipped = false;
+        if (MERGE_THROUGH_TO_SINGLE_SIDE) {
+            var topBlind = [], topThrough = [];
+            for (var ti = 0; ti < holes.topVert.length; ti++) {
+                if (holes.topVert[ti].through) topThrough.push(holes.topVert[ti]);
+                else topBlind.push(holes.topVert[ti]);
+            }
+            var botBlind = [], botThrough = [];
+            for (var bi = 0; bi < holes.botVert.length; bi++) {
+                if (holes.botVert[bi].through) botThrough.push(holes.botVert[bi]);
+                else botBlind.push(holes.botVert[bi]);
+            }
+
+            var topHasSideSpecific = topBlind.length > 0 || grooves.topGrooves.length > 0 || holes.horiz.length > 0 || contourElems.length > 0;
+            var botHasSideSpecific = botBlind.length > 0 || grooves.botGrooves.length > 0;
+
+            if (!topHasSideSpecific && botHasSideSpecific && topThrough.length > 0) {
+                // Only through-holes on Side A, blind holes/grooves on Side B -> merge all onto Side B (single file, no flip!)
+                holes.botVert = holes.botVert.concat(topThrough);
+                holes.topVert = [];
+                sideASingleFlipped = true;
+            } else if (botThrough.length > 0) {
+                // Move Side B through-holes onto Side A (eliminates Side B file if no blind holes/grooves remain on Side B)
+                holes.topVert = holes.topVert.concat(botThrough);
+                holes.botVert = botBlind;
+            }
+        }
+
         var artPos = padPos(safeGet(function () { return panel.ArtPos; }, ""));
         var pName = safeGet(function () { return String(panel.Name || ("Part_" + (pIdx + 1))); }, "Part");
         var baseName = sanitizeFileName((artPos ? (artPos + "_") : ((pIdx + 1) + "_")) + pName);
         var comment = "Pos: " + (artPos || (pIdx + 1)) + " | " + pName + " | " + fmt(L) + "x" + fmt(B) + "x" + fmt(T);
 
-        // Front / Top face program
-        var topMpr = buildMprContent(
-            { comment: comment + " (Side A)" },
-            L, B, T,
-            holes.topVert,
-            holes.horiz,
-            grooves.topGrooves,
-            contourElems
-        );
-        fs.writeFileSync(path.join(outDir, baseName + ".mpr"), topMpr, "utf8");
-        exportedFiles++;
-
         totalVert += holes.topVert.length + holes.botVert.length;
         totalHoriz += holes.horiz.length;
         totalGrooves += grooves.topGrooves.length + grooves.botGrooves.length;
 
-        // Back / Bottom face program (only if back-face drilling or grooves exist)
-        if (holes.botVert.length > 0 || grooves.botGrooves.length > 0) {
-            var flipped = flipHolesAndGrooves(L, B, holes.botVert, grooves.botGrooves);
-            var botMpr = buildMprContent(
-                { comment: comment + " (Side B, flipped around " + FLIP_AXIS_FOR_BACK + ")" },
+        if (sideASingleFlipped) {
+            // Single-side program machined from Side B (all through-holes merged onto Side B)
+            var flippedSingle = flipHolesAndGrooves(L, B, holes.botVert, grooves.botGrooves);
+            var singleMpr = buildMprContent(
+                { comment: comment + " (Side B single-setup, through-holes merged)" },
                 L, B, T,
-                flipped.vert,
+                flippedSingle.vert,
                 [],
-                flipped.grooves,
+                flippedSingle.grooves,
                 []
             );
-            fs.writeFileSync(path.join(outDir, baseName + "_B.mpr"), botMpr, "utf8");
+            fs.writeFileSync(path.join(outDir, baseName + ".mpr"), singleMpr, "utf8");
             exportedFiles++;
+        } else {
+            // Front / Top face program
+            var topMpr = buildMprContent(
+                { comment: comment + " (Side A)" },
+                L, B, T,
+                holes.topVert,
+                holes.horiz,
+                grooves.topGrooves,
+                contourElems
+            );
+            fs.writeFileSync(path.join(outDir, baseName + ".mpr"), topMpr, "utf8");
+            exportedFiles++;
+
+            // Back / Bottom face program (only if back-face blind holes or grooves remain)
+            if (holes.botVert.length > 0 || grooves.botGrooves.length > 0) {
+                var flipped = flipHolesAndGrooves(L, B, holes.botVert, grooves.botGrooves);
+                var botMpr = buildMprContent(
+                    { comment: comment + " (Side B, flipped around " + FLIP_AXIS_FOR_BACK + ")" },
+                    L, B, T,
+                    flipped.vert,
+                    [],
+                    flipped.grooves,
+                    []
+                );
+                fs.writeFileSync(path.join(outDir, baseName + "_B.mpr"), botMpr, "utf8");
+                exportedFiles++;
+            }
         }
     }
 

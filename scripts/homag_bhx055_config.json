@@ -4,6 +4,8 @@
   "mprHeaderVersion": "4.0 Alpha",
   "flipAxisForBack": "X",
   "throughToleranceMm": 0.5,
+  "mergeThroughHolesToSingleSide": true,
+  "requireArtPos": true,
   "skipNonCnc": true,
   "workpieceLimits": {
     "minLength": 200,
