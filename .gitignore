@@ -15,3 +15,8 @@ Thumbs.db
 *.bxf
 *.bxf2
 docs/api/
+topsolid-mcp/.ts6-ipc/
+bazis-to-topsolid/target/
+*.exe
+*.igz
+*.igz.bak
