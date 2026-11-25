@@ -608,7 +608,6 @@ where
     let components = doc.get_obj("Components")?;
 
     let mut apply_pairs: Vec<(String, String)> = Vec::new();
-    let mut deferred_layers: Vec<(ComObj, i32)> = Vec::new();
     let mut op_seq: usize = 0;
 
     for (idx, p) in model.panels.iter().enumerate() {
@@ -685,12 +684,9 @@ where
         if !p.art_pos.is_empty() {
             let _ = blk.put("Reference", ComArg::Str(&p.art_pos));
         }
-        if mode == ExportMode::NativeTemplates {
-            // Keep panels on visible Layer 0 during Use process; assign final layer after Phase 3
-            let _ = blk.put("Layer", ComArg::I32(0));
-        } else {
-            let _ = blk.put("Layer", ComArg::I32(p.layer));
-        }
+        // Keep all panels on Layer 0 (TopSolid's default new document only displays Layer 0;
+        // moving panels to Layers 1..4 hides them until the user manually enables those layers).
+        let _ = blk.put("Layer", ComArg::I32(0));
         let _ = blk.call(
             "SetTextProperty",
             &[ComArg::Str("Bazis_Material"), ComArg::Str(&p.material)],
@@ -1005,9 +1001,6 @@ where
             }
         }
 
-        if mode == ExportMode::NativeTemplates && p.layer != 0 {
-            deferred_layers.push((blk, p.layer));
-        }
     }
 
     // Phase 3: Batch-apply Assembly -> Use process so every panel gets 100% native TopSolid'Wood operations
@@ -1016,11 +1009,6 @@ where
         stats.native_applied = apply_use_process_batch(&apply_pairs, cancel, |done, _tot, msg| {
             on_progress(base_prog + done, total_units, msg);
         })?;
-    }
-
-    // Move panels to their final semantic layers (1=Carcass, 2=Doors, 3=Back, 4=Shelves)
-    for (blk, layer) in deferred_layers {
-        let _ = blk.put("Layer", ComArg::I32(layer));
     }
 
     // Optional auto-save .top
