@@ -4,16 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetMenu, GetMenuItemCount, GetMenuItemID,
-    GetMenuStringW, GetSubMenu, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
-    PostMessageW, SetCursorPos, SetForegroundWindow, SetProcessDPIAware, ShowWindow, MF_BYPOSITION,
-    SW_MAXIMIZE, WM_COMMAND,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, IsWindowVisible, SetCursorPos, SetForegroundWindow, SetProcessDPIAware,
+    ShowWindow, SW_MAXIMIZE,
 };
 
 pub fn init_dpi_aware() {
@@ -70,17 +69,91 @@ pub fn find_topsolid_hwnd() -> Option<HWND> {
     }
 }
 
-unsafe extern "system" fn enum_prompt_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+/// Live scan of all visible Static labels inside TopSolid's prompt bar (y in 180..340).
+/// TopSolid destroys and recreates prompt-bar child controls on every step transition,
+/// so we never cache a single HWND across transitions.
+struct PromptTextAcc {
+    text: String,
+}
+
+unsafe extern "system" fn enum_prompt_text_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if IsWindowVisible(hwnd) == 0 {
         return 1;
     }
     if get_class_name(hwnd) == "Static" {
-        let t = get_window_text(hwnd);
-        let low = t.to_ascii_lowercase();
-        if low.contains("choose a function")
-            || low.contains("component to use")
-            || low.contains("select an element")
-        {
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 {
+            let t = get_window_text(hwnd);
+            if !t.is_empty() {
+                let acc = &mut *(lparam as *mut PromptTextAcc);
+                if !acc.text.is_empty() {
+                    acc.text.push(' ');
+                }
+                acc.text.push_str(&t);
+            }
+        }
+    }
+    1
+}
+
+fn get_prompt_bar_text(parent: HWND) -> String {
+    let mut acc = PromptTextAcc { text: String::new() };
+    unsafe {
+        EnumChildWindows(parent, Some(enum_prompt_text_cb), &mut acc as *mut PromptTextAcc as LPARAM);
+    }
+    acc.text
+}
+
+struct ButtonSearch<'a> {
+    needle_lower: &'a str,
+    exact: bool,
+    found_rect: Option<RECT>,
+}
+
+unsafe extern "system" fn enum_prompt_btn_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    if get_class_name(hwnd) == "Button" {
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 && r.right > r.left + 8 {
+            let t = get_window_text(hwnd).trim().to_ascii_lowercase();
+            let search = &mut *(lparam as *mut ButtonSearch);
+            let matched = if search.exact {
+                t == search.needle_lower
+            } else {
+                t.contains(search.needle_lower)
+            };
+            if matched {
+                search.found_rect = Some(r);
+                return 0;
+            }
+        }
+    }
+    1
+}
+
+/// Find a visible prompt-bar Win32 Button by text (exact or substring, case-insensitive)
+/// and return its exact screen center `(cx, cy)`. Works at any DPI / process name width.
+fn find_prompt_button_center(parent: HWND, needle_lower: &str, exact: bool) -> Option<(i32, i32)> {
+    let mut search = ButtonSearch {
+        needle_lower,
+        exact,
+        found_rect: None,
+    };
+    unsafe {
+        EnumChildWindows(parent, Some(enum_prompt_btn_cb), &mut search as *mut ButtonSearch as LPARAM);
+    }
+    search.found_rect.map(|r| ((r.left + r.right) / 2, (r.top + r.bottom) / 2))
+}
+
+unsafe extern "system" fn enum_edit_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if IsWindowVisible(hwnd) == 0 {
+        return 1;
+    }
+    if get_class_name(hwnd) == "Edit" {
+        let mut r: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 && r.right > r.left + 8 {
             let out = lparam as *mut HWND;
             *out = hwnd;
             return 0;
@@ -89,10 +162,10 @@ unsafe extern "system" fn enum_prompt_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     1
 }
 
-fn find_prompt_static(parent: HWND) -> Option<HWND> {
+fn find_prompt_edit(parent: HWND) -> Option<HWND> {
     let mut found: HWND = std::ptr::null_mut();
     unsafe {
-        EnumChildWindows(parent, Some(enum_prompt_cb), &mut found as *mut HWND as LPARAM);
+        EnumChildWindows(parent, Some(enum_edit_cb), &mut found as *mut HWND as LPARAM);
     }
     if found.is_null() {
         None
@@ -101,84 +174,49 @@ fn find_prompt_static(parent: HWND) -> Option<HWND> {
     }
 }
 
-/// Dynamically locate Assembly -> Use process menu command ID (typically 12326 / 0x3026).
-fn find_use_process_cmd_id(hwnd: HWND) -> u32 {
-    unsafe {
-        let menu = GetMenu(hwnd);
-        if !menu.is_null() {
-            let cnt = GetMenuItemCount(menu);
-            for i in 0..cnt {
-                let mut buf = [0u16; 128];
-                let n = GetMenuStringW(menu, i as u32, buf.as_mut_ptr(), 128, MF_BYPOSITION);
-                if n > 0 {
-                    let s = String::from_utf16_lossy(&buf[..n as usize]).to_ascii_lowercase();
-                    if s.contains("assembly") {
-                        let sub = GetSubMenu(menu, i);
-                        if !sub.is_null() {
-                            let sc = GetMenuItemCount(sub);
-                            for j in 0..sc {
-                                let mut sbuf = [0u16; 128];
-                                let sn = GetMenuStringW(
-                                    sub,
-                                    j as u32,
-                                    sbuf.as_mut_ptr(),
-                                    128,
-                                    MF_BYPOSITION,
-                                );
-                                if sn > 0 {
-                                    let st = String::from_utf16_lossy(&sbuf[..sn as usize])
-                                        .to_ascii_lowercase();
-                                    if st.contains("use process") {
-                                        let id = GetMenuItemID(sub, j);
-                                        if id != u32::MAX && id != 0 {
-                                            return id;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+fn focus_prompt_edit(parent: HWND) {
+    if let Some(eh) = find_prompt_edit(parent) {
+        unsafe {
+            let mut r: RECT = std::mem::zeroed();
+            if GetWindowRect(eh, &mut r) != 0 {
+                let cx = (r.left + r.right) / 2;
+                let cy = (r.top + r.bottom) / 2;
+                click(cx.min(r.left + 80), cy);
+                sleep(Duration::from_millis(20));
+                return;
             }
         }
     }
-    12326
+    // Fallback coordinate inside TopSolid's prompt edit box
+    click(480, 260);
+    sleep(Duration::from_millis(20));
 }
 
-fn wait_prompt_contains_any(prompt: Option<HWND>, needles: &[&str], timeout_ms: u64) -> bool {
-    let Some(h) = prompt else {
-        sleep(Duration::from_millis(timeout_ms.min(220)));
-        return true;
-    };
+fn wait_prompt_bar_contains_any(parent: HWND, needles: &[&str], timeout_ms: u64) -> bool {
     let start = Instant::now();
     while start.elapsed().as_millis() < timeout_ms as u128 {
-        let cur = get_window_text(h).to_ascii_lowercase();
+        let cur = get_prompt_bar_text(parent).to_ascii_lowercase();
         if needles.iter().any(|n| cur.contains(n)) {
             return true;
         }
-        sleep(Duration::from_millis(8));
+        sleep(Duration::from_millis(10));
     }
     false
 }
 
-fn wait_prompt_contains(prompt: Option<HWND>, needle: &str, timeout_ms: u64) -> bool {
-    wait_prompt_contains_any(prompt, &[needle], timeout_ms)
+fn wait_prompt_bar_contains(parent: HWND, needle: &str, timeout_ms: u64) -> bool {
+    wait_prompt_bar_contains_any(parent, &[needle], timeout_ms)
 }
 
-fn wait_prompt_change(prompt: Option<HWND>, prev: &str, timeout_ms: u64) -> String {
-    let Some(h) = prompt else {
-        sleep(Duration::from_millis(timeout_ms.min(260)));
-        return String::new();
-    };
+fn wait_prompt_button(parent: HWND, needle_lower: &str, exact: bool, timeout_ms: u64) -> Option<(i32, i32)> {
     let start = Instant::now();
     while start.elapsed().as_millis() < timeout_ms as u128 {
-        let cur = get_window_text(h);
-        if cur != prev {
-            return cur;
+        if let Some(pt) = find_prompt_button_center(parent, needle_lower, exact) {
+            return Some(pt);
         }
-        sleep(Duration::from_millis(8));
+        sleep(Duration::from_millis(10));
     }
-    get_window_text(h)
+    None
 }
 
 pub fn focus_topsolid() -> Result<HWND, String> {
@@ -282,9 +320,10 @@ pub fn modify_active_doc_params(params: &[(String, String)]) -> Result<(), Strin
     Ok(())
 }
 
-/// Accelerated batch-apply Assembly -> Use process for every (cmp_name, panel_name) pair.
-/// Uses direct WM_COMMAND (no Assembly dropdown clicks) + live prompt-bar polling (8 ms)
-/// instead of blind 2-second sleeps — ~6x-8x faster and immune to slow-op race conditions.
+/// Bulletproof state-machine batch-apply of Assembly -> Use process.
+/// Live-scans TopSolid's prompt bar (`Static`, `Button`, `Edit` child HWNDs) at every step
+/// so variable button widths (`PROCESS=MYDRILL`, `PROCESS=MYPOCKET`, etc.), DPI scaling,
+/// and heavy 60+ panel redraws can never desynchronize the batch.
 pub fn apply_use_process_batch<F>(
     pairs: &[(String, String)],
     cancel: &AtomicBool,
@@ -297,10 +336,10 @@ where
         return Ok(0);
     }
     let hwnd = focus_topsolid()?;
-    let cmd_id = find_use_process_cmd_id(hwnd);
     tap_vk(0x1B);
-    sleep(Duration::from_millis(60));
-    let prompt_hwnd = find_prompt_static(hwnd);
+    sleep(Duration::from_millis(80));
+    tap_vk(0x1B);
+    sleep(Duration::from_millis(80));
 
     let total = pairs.len();
     let mut done = 0usize;
@@ -310,45 +349,88 @@ where
             return Err(format!("Stopped by user after {}/{} operations.", done, total));
         }
 
-        // Ensure we are at "Component to use:" via instant WM_COMMAND (no Assembly menu click)
-        let cur_prompt = prompt_hwnd.map(get_window_text).unwrap_or_default();
-        if !cur_prompt.to_ascii_lowercase().contains("component to use") {
-            if !cur_prompt.to_ascii_lowercase().contains("choose a function") {
+        // Step 0: Guarantee TopSolid is at "Component to use:" (retry up to 3x on heavy scenes)
+        let mut at_comp_prompt = get_prompt_bar_text(hwnd)
+            .to_ascii_lowercase()
+            .contains("component to use");
+        for _attempt in 0..3 {
+            if at_comp_prompt {
+                break;
+            }
+            let cur = get_prompt_bar_text(hwnd).to_ascii_lowercase();
+            if !cur.contains("choose a function") {
                 tap_vk(0x1B);
-                wait_prompt_contains(prompt_hwnd, "choose a function", 300);
+                sleep(Duration::from_millis(80));
+                tap_vk(0x1B);
+                wait_prompt_bar_contains(hwnd, "choose a function", 800);
             }
-            unsafe {
-                PostMessageW(hwnd, WM_COMMAND, cmd_id as usize, 0);
+            // Open Assembly (540, 62) -> Use process (660, 480)
+            click(540, 62);
+            sleep(Duration::from_millis(240));
+            click(660, 480);
+            if wait_prompt_bar_contains(hwnd, "component to use", 1500) {
+                at_comp_prompt = true;
+                break;
             }
-            if !wait_prompt_contains(prompt_hwnd, "component to use", 350) {
-                click(540, 62);
-                sleep(Duration::from_millis(140));
-                click(660, 480);
-                wait_prompt_contains(prompt_hwnd, "component to use", 500);
-            }
+            sleep(Duration::from_millis(120));
+        }
+        if !at_comp_prompt {
+            tap_vk(0x1B);
+            done += 1;
+            on_progress(done, total, &format!("Skipped (Use process menu timeout): {} -> {}", cmp, panel));
+            continue;
         }
 
-        // 1. Component name + ENTER (prompt stays "Component to use:" while [PROCESS=...] pops up)
+        // Step 1: Focus the prompt [Edit] box explicitly (heavy scenes steal focus during redraw),
+        // clear any leftover text, type component name, press ENTER, and wait for [PROCESS=...] button.
+        focus_prompt_edit(hwnd);
+        clear_input();
         type_unicode(cmp);
         tap_vk(0x0D);
-        sleep(Duration::from_millis(240));
 
-        // 2. Click [PROCESS=...] button at (445, 263)
-        let before_proc = prompt_hwnd.map(get_window_text).unwrap_or_default();
-        click(445, 263);
-        let _ = wait_prompt_change(prompt_hwnd, &before_proc, 300);
-        sleep(Duration::from_millis(60));
+        let proc_btn = wait_prompt_button(hwnd, "process=", false, 1800);
+        let Some((px, py)) = proc_btn else {
+            tap_vk(0x1B);
+            sleep(Duration::from_millis(80));
+            done += 1;
+            on_progress(done, total, &format!("Skipped (PROCESS button not found): {} -> {}", cmp, panel));
+            continue;
+        };
 
-        // 3. Target panel name + ENTER
+        // Step 2: Click exact center of [PROCESS=...] button and wait for "Shape to modify:"
+        let mut at_shape_prompt = false;
+        for _try_btn in 0..2 {
+            click(px, py);
+            if wait_prompt_bar_contains_any(hwnd, &["shape to modify", "element to modify", "shape"], 1200) {
+                at_shape_prompt = true;
+                break;
+            }
+            sleep(Duration::from_millis(120));
+        }
+        if !at_shape_prompt {
+            tap_vk(0x1B);
+            sleep(Duration::from_millis(80));
+            done += 1;
+            on_progress(done, total, &format!("Skipped (Shape prompt not reached): {} -> {}", cmp, panel));
+            continue;
+        }
+
+        // Step 3: Focus prompt [Edit] box, type target panel name + ENTER, wait for [OK] button
+        focus_prompt_edit(hwnd);
+        clear_input();
         type_unicode(panel);
         tap_vk(0x0D);
-        sleep(Duration::from_millis(220));
 
-        // 4. Second ENTER to confirm and execute the native TopSolid'Wood operation
-        tap_vk(0x0D);
-        // Poll dynamically until TopSolid finishes Parasolid boolean & returns to next component or idle
-        wait_prompt_contains_any(prompt_hwnd, &["component to use", "choose a function"], 1200);
-        sleep(Duration::from_millis(35));
+        // Step 4: Click [OK] button (or press ENTER) to execute the native TopSolid'Wood operation
+        if let Some((ox, oy)) = wait_prompt_button(hwnd, "ok", true, 1500) {
+            click(ox, oy);
+        } else {
+            tap_vk(0x0D);
+        }
+
+        // Wait dynamically until TopSolid finishes Parasolid operation & returns to "Component to use:"
+        wait_prompt_bar_contains_any(hwnd, &["component to use", "choose a function"], 4000);
+        sleep(Duration::from_millis(20));
 
         done += 1;
         on_progress(done, total, &format!("Use process: {} -> {}", cmp, panel));
