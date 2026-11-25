@@ -562,3 +562,123 @@ pub fn uninstall_topsolid_input_lock() {
         }
     }
 }
+
+// ============================================================================
+// Clean TopSolid'Wood 6.25 + TopSolid MCP bridge restart before export
+// ============================================================================
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+fn resolve_mcp_bridge_ps1() -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(scripts_dir) = exe.parent() {
+            if let Some(bazis_dir) = scripts_dir.parent() {
+                if let Some(works_dir) = bazis_dir.parent() {
+                    candidates.push(works_dir.join("cnc").join("topsolid-mcp").join("agent").join("ts6_bridge.ps1"));
+                }
+            }
+        }
+    }
+    candidates.push(std::path::PathBuf::from(r"Y:\Works\cnc\topsolid-mcp\agent\ts6_bridge.ps1"));
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn resolve_topsolid_exe() -> Option<std::path::PathBuf> {
+    let candidates = [
+        r"C:\Missler\V625\bin\top625.exe",
+        r"C:\Missler\V624\bin\top624.exe",
+        r"C:\Missler\V623\bin\top623.exe",
+    ];
+    candidates
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// Close any running TopSolid 6.25 instance, restart the TopSolid MCP bridge,
+/// and launch a clean TopSolid 6.25 window ready for COM automation.
+pub fn restart_topsolid_and_mcp<F>(cancel: &AtomicBool, mut on_status: F) -> Result<(), String>
+where
+    F: FnMut(&str),
+{
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // 1. Close running TopSolid 6.25
+    on_status("Closing running TopSolid'Wood 6.25...");
+    let _ = Command::new("taskkill")
+        .args(["/F", "/IM", "top625.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    sleep(Duration::from_millis(800));
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Stopped by user before restart.".into());
+    }
+
+    // 2. Restart TopSolid MCP bridge (ts6_bridge.ps1) if available
+    if let Some(bridge_ps1) = resolve_mcp_bridge_ps1() {
+        on_status("Restarting TopSolid MCP bridge...");
+        let kill_cmd = "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | Where-Object { $_.CommandLine -like '*ts6_bridge.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        let _ = Command::new("powershell.exe")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", kill_cmd])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        sleep(Duration::from_millis(300));
+        let _ = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &bridge_ps1.to_string_lossy(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        sleep(Duration::from_millis(400));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Stopped by user during MCP bridge restart.".into());
+    }
+
+    // 3. Launch fresh TopSolid'Wood 6.25
+    if let Some(ts_exe) = resolve_topsolid_exe() {
+        on_status("Launching fresh TopSolid'Wood 6.25...");
+        Command::new(&ts_exe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to launch '{}': {}", ts_exe.display(), e))?;
+
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed().as_secs() < 40 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped by user while waiting for TopSolid'Wood 6.25.".into());
+            }
+            if find_topsolid_hwnd().is_some() {
+                found = true;
+                break;
+            }
+            sleep(Duration::from_millis(250));
+        }
+        if !found {
+            return Err("Timed out waiting for TopSolid'Wood 6.25 window to appear.".into());
+        }
+        // Let TopSolid finish initializing toolbars and COM server
+        on_status("Waiting for TopSolid'Wood 6.25 to finish startup...");
+        for _ in 0..8 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped by user while waiting for TopSolid startup.".into());
+            }
+            sleep(Duration::from_millis(250));
+        }
+    }
+    Ok(())
+}

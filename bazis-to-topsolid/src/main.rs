@@ -113,14 +113,14 @@ mod win_gui {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
-        PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowPos, SetWindowTextW,
-        ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MessageBoxW,
+        PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowPos,
+        SetWindowTextW, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
         BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL,
-        ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST, HWND_TOPMOST, MSG, SWP_NOMOVE, SWP_NOSIZE,
-        SW_SHOW, WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER,
-        WS_CAPTION, WS_CHILD, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
-        WS_VSCROLL,
+        ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST, HWND_TOPMOST, IDOK, MB_ICONWARNING,
+        MB_OKCANCEL, MB_SETFOREGROUND, MSG, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WM_APP, WM_COMMAND,
+        WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP,
+        WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
     };
 
     use crate::com::to_wide_null;
@@ -139,6 +139,7 @@ mod win_gui {
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
     const WM_APP_DONE: u32 = WM_APP + 2;
+    const WM_APP_LOCK_TOPSOLID: u32 = WM_APP + 3;
 
     struct AppState {
         hwnd_main: HWND,
@@ -235,8 +236,50 @@ mod win_gui {
         rest[..slash].trim().parse::<usize>().ok()
     }
 
+    fn confirm_pre_export_dialog(owner: HWND) -> bool {
+        let title = to_wide_null("Prepare TopSolid'Wood 6.25 for Export");
+        let body = to_wide_null(
+            "Before starting the export:\r\n\r\n\
+             1. Save and close all open projects in TopSolid'Wood 6.25.\r\n\
+             2. Close TopSolid'Wood 6.25 (or click OK to close/restart it automatically).\r\n\r\n\
+             After you click OK:\r\n\
+             - The TopSolid MCP bridge will be restarted.\r\n\
+             - A clean TopSolid'Wood 6.25 instance will be launched.\r\n\r\n\
+             WARNING: While the export is running, TopSolid'Wood 6.25 will be LOCKED.\r\n\
+             Working in TopSolid will be impossible until export finishes (or you click Stop).\r\n\r\n\
+             Continue?",
+        );
+        let rc = unsafe {
+            MessageBoxW(
+                owner,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_OKCANCEL | MB_ICONWARNING | MB_SETFOREGROUND,
+            )
+        };
+        rc == IDOK
+    }
+
     fn start_export_worker() {
-        let (hwnd_main, model, mode, auto_save, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
+        let pre_hwnd = {
+            let guard = STATE.lock().unwrap();
+            let Some(st) = guard.as_ref() else { return };
+            if st.running {
+                return;
+            }
+            if st.model.is_none() {
+                append_log(st.hwnd_log, "No model JSON loaded. Run export_topsolid6.js from Bazis 2022.");
+                return;
+            }
+            st.hwnd_main
+        };
+
+        // Ask user to save & close open projects and warn that TopSolid will be restarted & locked
+        if !confirm_pre_export_dialog(pre_hwnd) {
+            return;
+        }
+
+        let (hwnd_main, model, mode, auto_save, want_lock, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
             let mut guard = STATE.lock().unwrap();
             let st = match guard.as_mut() {
                 Some(s) => s,
@@ -247,30 +290,19 @@ mod win_gui {
             }
             let model = match st.model.clone() {
                 Some(m) => m,
-                None => {
-                    append_log(st.hwnd_log, "No model JSON loaded. Run export_topsolid6.js from Bazis 2022.");
-                    return;
-                }
+                None => return,
             };
             let is_native = unsafe { SendMessageW(st.hwnd_radio_native, BM_GETCHECK, 0, 0) } == 1;
             let auto_save = unsafe { SendMessageW(st.hwnd_chk_save, BM_GETCHECK, 0, 0) } == 1;
             let want_lock = unsafe { SendMessageW(st.hwnd_chk_lock, BM_GETCHECK, 0, 0) } == 1;
             st.running = true;
+            st.input_locked = false;
             st.start_time = Some(Instant::now());
             st.total_panels = model.panels.len();
             st.panels_done.store(0, Ordering::Relaxed);
             st.ops_done.store(0, Ordering::Relaxed);
             *st.prog_cur.lock().unwrap() = (0, 100);
             st.cancel.store(false, Ordering::Relaxed);
-
-            if want_lock {
-                st.input_locked = win_ui::install_topsolid_input_lock();
-                if st.input_locked {
-                    append_log(st.hwnd_log, "TopSolid mouse/keyboard input LOCKED (click Stop to cancel & unlock).");
-                }
-            } else {
-                st.input_locked = false;
-            }
 
             unsafe {
                 EnableWindow(st.hwnd_start, 0);
@@ -283,7 +315,7 @@ mod win_gui {
             append_log(
                 st.hwnd_log,
                 &format!(
-                    "Starting {} export for '{}'...",
+                    "Preparing clean TopSolid + MCP restart for {} export ('{}')...",
                     if is_native { "NATIVE TopSolid'Wood" } else { "Fast Parasolid" },
                     model.model_name
                 ),
@@ -297,6 +329,7 @@ mod win_gui {
                     ExportMode::FastParasolid
                 },
                 auto_save,
+                want_lock,
                 st.cancel.clone(),
                 st.pending_logs.clone(),
                 st.last_status.clone(),
@@ -310,6 +343,28 @@ mod win_gui {
         let t_start = Instant::now();
         thread::spawn(move || {
             let hwnd = hwnd_addr as HWND;
+
+            // Step 0: Cleanly close/restart TopSolid 6.25 and TopSolid MCP bridge
+            let prep_res = win_ui::restart_topsolid_and_mcp(&cancel, |msg| {
+                *last_status.lock().unwrap() = msg.to_string();
+                pending_logs.lock().unwrap().push(msg.to_string());
+                unsafe { PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0) };
+            });
+
+            if let Err(e) = prep_res {
+                let elapsed_s = t_start.elapsed().as_secs_f64();
+                let msg = format!("STOPPED/ERROR after {}: {}", format_duration(elapsed_s as u64), e);
+                *last_status.lock().unwrap() = msg.clone();
+                pending_logs.lock().unwrap().push(msg);
+                unsafe { PostMessageW(hwnd, WM_APP_DONE, 0, 0) };
+                return;
+            }
+
+            // Lock the newly launched TopSolid process input on the GUI thread before starting export
+            if want_lock {
+                unsafe { PostMessageW(hwnd, WM_APP_LOCK_TOPSOLID, 0, 0) };
+            }
+
             let res = exporter::run_export(&model, mode, auto_save, &cancel, |cur, tot, msg| {
                 *prog_cur.lock().unwrap() = (cur, tot);
                 if let Some(pidx) = parse_panel_index(msg) {
@@ -390,6 +445,18 @@ mod win_gui {
                 if wparam == ID_TIMER_METRICS {
                     if let Some(st) = STATE.lock().unwrap().as_ref() {
                         set_text(st.hwnd_metrics, &format_metrics_line(st));
+                    }
+                }
+                0
+            }
+            WM_APP_LOCK_TOPSOLID => {
+                if let Some(st) = STATE.lock().unwrap().as_mut() {
+                    if st.running && !st.cancel.load(Ordering::Relaxed) {
+                        st.input_locked = win_ui::install_topsolid_input_lock();
+                        if st.input_locked {
+                            append_log(st.hwnd_log, "TopSolid mouse/keyboard input LOCKED (click Stop to cancel & unlock).");
+                            set_text(st.hwnd_metrics, &format_metrics_line(st));
+                        }
                     }
                 }
                 0
