@@ -76,6 +76,28 @@ function getFurniture(key) {
 
 // --- Geometry Helpers ---
 function getGlobalBox(obj) {
+    // Use true 8-corner ToGlobal() transform for panels (works reliably even inside nested fragments!)
+    if (obj && obj.Contour && obj.ToGlobal) {
+        var cMin = obj.Contour.Min;
+        var cMax = obj.Contour.Max;
+        var t = obj.Thickness || 0;
+        var xs = [cMin.x, cMax.x], ys = [cMin.y, cMax.y], zs = [0, t];
+        var minX = 1e12, maxX = -1e12, minY = 1e12, maxY = -1e12, minZ = 1e12, maxZ = -1e12;
+        for (var ix = 0; ix < 2; ix++) {
+            for (var iy = 0; iy < 2; iy++) {
+                for (var iz = 0; iz < 2; iz++) {
+                    var g = obj.ToGlobal(NewVector(xs[ix], ys[iy], zs[iz]));
+                    if (g.x < minX) minX = g.x;
+                    if (g.x > maxX) maxX = g.x;
+                    if (g.y < minY) minY = g.y;
+                    if (g.y > maxY) maxY = g.y;
+                    if (g.z < minZ) minZ = g.z;
+                    if (g.z > maxZ) maxZ = g.z;
+                }
+            }
+        }
+        return { minX: minX, maxX: maxX, minY: minY, maxY: maxY, minZ: minZ, maxZ: maxZ };
+    }
     return {
         minX: obj.GMin.x, maxX: obj.GMax.x,
         minY: obj.GMin.y, maxY: obj.GMax.y,
