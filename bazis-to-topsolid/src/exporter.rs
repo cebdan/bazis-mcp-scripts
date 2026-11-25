@@ -33,7 +33,77 @@ pub struct ExportStats {
 struct VariantSpec {
     src: String,
     dst: String,
-    params: Vec<(String, String)>,
+    params: Vec<(String, String, f64)>, // (name, "35mm" UI fallback, 0.035 meters for ASCII patch)
+}
+
+fn fmt_meters(m: f64) -> String {
+    let s = format!("{:.6}", m);
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Patch {D_PARAM driver values directly in an ASCII-format TopSolid .top template.
+/// Returns Ok(true) if the file is ASCII and all requested parameters were patched,
+/// or Ok(false) if the source template is binary/compressed (caller should use UI fallback).
+fn patch_ascii_top_params(
+    src: &str,
+    dst: &str,
+    params: &[(String, String, f64)],
+) -> Result<bool, String> {
+    let raw = fs::read(src).map_err(|e| format!("Read {} failed: {}", src, e))?;
+    if !raw.starts_with(b"[TOP\r\n") && !raw.starts_with(b"[TOP\n") {
+        return Ok(false);
+    }
+    let text: String = raw.iter().map(|&b| b as char).collect();
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .collect();
+
+    // Update embedded $FILENAME self-reference if present
+    for l in &mut lines {
+        if l.eq_ignore_ascii_case(src) {
+            *l = dst.to_string();
+        }
+    }
+
+    let mut matched = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i] == "{D_PARAM" {
+            let mut end = i + 1;
+            while end < lines.len() && lines[end] != "}" {
+                end += 1;
+            }
+            if end < lines.len() && i + 28 < end && lines[i + 5] == "S1" {
+                let pname = lines[i + 6].as_str();
+                if let Some((_, _, val_m)) = params.iter().find(|(k, _, _)| k == pname) {
+                    if lines[i + 27].starts_with('R') && lines[i + 28].starts_with('R') {
+                        let rval = format!("R{}", fmt_meters(*val_m));
+                        lines[i + 27] = rval.clone();
+                        lines[i + 28] = rval;
+                        matched += 1;
+                    }
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    if matched != params.len() {
+        return Ok(false);
+    }
+
+    let out_str = lines.join("\r\n");
+    let out_bytes: Vec<u8> = out_str.chars().map(|c| c as u8).collect();
+    fs::write(dst, out_bytes).map_err(|e| format!("Write {} failed: {}", dst, e))?;
+    Ok(true)
 }
 
 fn num_key(n: f64) -> String {
@@ -195,9 +265,9 @@ where
                                 num_key(c.depth_mm)
                             ),
                             vec![
-                                ("W".into(), format!("{}mm", c.box_wmm)),
-                                ("L".into(), format!("{}mm", c.box_lmm)),
-                                ("H".into(), format!("{}mm", c.depth_mm)),
+                                ("W".into(), format!("{}mm", c.box_wmm), c.box_wmm * 0.001),
+                                ("L".into(), format!("{}mm", c.box_lmm), c.box_lmm * 0.001),
+                                ("H".into(), format!("{}mm", c.depth_mm), c.depth_mm * 0.001),
                             ],
                         )
                     } else {
@@ -209,9 +279,9 @@ where
                                 num_key(c.length_mm)
                             ),
                             vec![
-                                ("W".into(), format!("{}mm", c.width_mm)),
-                                ("H".into(), format!("{}mm", c.depth_mm)),
-                                ("L".into(), format!("{}mm", c.length_mm)),
+                                ("W".into(), format!("{}mm", c.width_mm), c.width_mm * 0.001),
+                                ("H".into(), format!("{}mm", c.depth_mm), c.depth_mm * 0.001),
+                                ("L".into(), format!("{}mm", c.length_mm), c.length_mm * 0.001),
                             ],
                         )
                     };
@@ -245,8 +315,8 @@ where
                                 src: src.clone(),
                                 dst,
                                 params: vec![
-                                    ("D".into(), format!("{}mm", h.diam_mm)),
-                                    ("H".into(), format!("{}mm", h.depth_mm)),
+                                    ("D".into(), format!("{}mm", h.diam_mm), h.diam_mm * 0.001),
+                                    ("H".into(), format!("{}mm", h.depth_mm), h.depth_mm * 0.001),
                                 ],
                             });
                         }
@@ -293,11 +363,21 @@ where
                 total_units,
                 &format!("Building cached template: {}", Path::new(&v.dst).file_name().unwrap_or_default().to_string_lossy()),
             );
-            fs::copy(&v.src, &v.dst)
-                .map_err(|e| format!("Copy {} -> {} failed: {}", v.src, v.dst, e))?;
+            let patched_ascii = patch_ascii_top_params(&v.src, &v.dst, &v.params)?;
+            if !patched_ascii {
+                fs::copy(&v.src, &v.dst)
+                    .map_err(|e| format!("Copy {} -> {} failed: {}", v.src, v.dst, e))?;
+            }
             let _ = docs.call("Open", &[ComArg::Str(&v.dst)])?;
-            sleep(Duration::from_millis(220));
-            modify_active_doc_params(&v.params)?;
+            sleep(Duration::from_millis(160));
+            if !patched_ascii {
+                let ui_params: Vec<(String, String)> = v
+                    .params
+                    .iter()
+                    .map(|(k, s, _)| (k.clone(), s.clone()))
+                    .collect();
+                modify_active_doc_params(&ui_params)?;
+            }
             let cur = app.get_obj("CurrentDocument")?;
             let cur_doc = cur.get_obj("Document")?;
             let _ = cur_doc.call("Save", &[])?;
