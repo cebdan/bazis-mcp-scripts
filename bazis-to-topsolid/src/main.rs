@@ -96,9 +96,10 @@ fn main() {
 mod win_gui {
     use std::path::PathBuf;
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Instant;
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
@@ -112,11 +113,12 @@ mod win_gui {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
-        PostQuitMessage, RegisterClassW, SendMessageW, SetWindowTextW, ShowWindow,
-        TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON,
-        BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-        MSG, SW_SHOW, WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_BORDER,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
+        PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowPos, SetWindowTextW,
+        ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+        BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL,
+        ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST, HWND_TOPMOST, MSG, SWP_NOMOVE, SWP_NOSIZE,
+        SW_SHOW, WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER,
         WS_CAPTION, WS_CHILD, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE,
         WS_VSCROLL,
     };
@@ -125,12 +127,15 @@ mod win_gui {
     use crate::exporter::{self, ExportMode};
     use crate::load_model;
     use crate::model::BazisExportModel;
+    use crate::win_ui;
 
     const ID_RADIO_NATIVE: usize = 101;
     const ID_RADIO_FAST: usize = 102;
     const ID_CHK_AUTOSAVE: usize = 103;
     const ID_BTN_START: usize = 104;
     const ID_BTN_STOP: usize = 105;
+    const ID_CHK_LOCK_INPUT: usize = 106;
+    const ID_TIMER_METRICS: usize = 1;
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
     const WM_APP_DONE: u32 = WM_APP + 2;
@@ -139,13 +144,20 @@ mod win_gui {
         hwnd_main: HWND,
         hwnd_radio_native: HWND,
         hwnd_chk_save: HWND,
+        hwnd_chk_lock: HWND,
         hwnd_progress: HWND,
+        hwnd_metrics: HWND,
         hwnd_status: HWND,
         hwnd_log: HWND,
         hwnd_start: HWND,
         hwnd_stop: HWND,
         model: Option<BazisExportModel>,
         running: bool,
+        input_locked: bool,
+        start_time: Option<Instant>,
+        total_panels: usize,
+        panels_done: Arc<AtomicUsize>,
+        ops_done: Arc<AtomicUsize>,
         cancel: Arc<AtomicBool>,
         pending_logs: Arc<Mutex<Vec<String>>>,
         last_status: Arc<Mutex<String>>,
@@ -154,6 +166,53 @@ mod win_gui {
 
     static STATE: Mutex<Option<AppState>> = Mutex::new(None);
     unsafe impl Send for AppState {}
+
+    fn format_duration(secs: u64) -> String {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        if h > 0 {
+            format!("{:02}:{:02}:{:02}", h, m, s)
+        } else {
+            format!("{:02}:{:02}", m, s)
+        }
+    }
+
+    fn format_metrics_line(st: &AppState) -> String {
+        let Some(t0) = st.start_time else {
+            return "Elapsed: 00:00  |  Speed: -- parts/min, -- ops/min  |  ETA: --:--".into();
+        };
+        let elapsed_s = t0.elapsed().as_secs_f64();
+        let mins = (elapsed_s / 60.0).max(1.0 / 60.0);
+        let p_done = st.panels_done.load(Ordering::Relaxed);
+        let o_done = st.ops_done.load(Ordering::Relaxed);
+        let (cur, tot) = *st.prog_cur.lock().unwrap();
+
+        let parts_per_min = if elapsed_s >= 1.0 { p_done as f64 / mins } else { 0.0 };
+        let ops_per_min = if elapsed_s >= 1.0 { o_done as f64 / mins } else { 0.0 };
+
+        let eta_str = if !st.running {
+            "Done".to_string()
+        } else if cur > 2 && tot > cur && elapsed_s >= 2.0 {
+            let rem_s = (elapsed_s / cur as f64) * (tot - cur) as f64;
+            format!("~{}", format_duration(rem_s.round() as u64))
+        } else {
+            "--:--".to_string()
+        };
+
+        let lock_badge = if st.input_locked { "  |  [TopSolid LOCKED]" } else { "" };
+        format!(
+            "Elapsed: {}  |  Parts: {}/{} ({:.1}/min)  |  Ops: {} ({:.1}/min)  |  ETA: {}{}",
+            format_duration(elapsed_s as u64),
+            p_done,
+            st.total_panels,
+            parts_per_min,
+            o_done,
+            ops_per_min,
+            eta_str,
+            lock_badge
+        )
+    }
 
     fn set_text(hwnd: HWND, text: &str) {
         let w = to_wide_null(text);
@@ -170,8 +229,14 @@ mod win_gui {
         }
     }
 
+    fn parse_panel_index(msg: &str) -> Option<usize> {
+        let rest = msg.strip_prefix("Panel ")?;
+        let slash = rest.find('/')?;
+        rest[..slash].trim().parse::<usize>().ok()
+    }
+
     fn start_export_worker() {
-        let (hwnd_main, model, mode, auto_save, cancel, pending_logs, last_status, prog_cur) = {
+        let (hwnd_main, model, mode, auto_save, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
             let mut guard = STATE.lock().unwrap();
             let st = match guard.as_mut() {
                 Some(s) => s,
@@ -189,12 +254,32 @@ mod win_gui {
             };
             let is_native = unsafe { SendMessageW(st.hwnd_radio_native, BM_GETCHECK, 0, 0) } == 1;
             let auto_save = unsafe { SendMessageW(st.hwnd_chk_save, BM_GETCHECK, 0, 0) } == 1;
+            let want_lock = unsafe { SendMessageW(st.hwnd_chk_lock, BM_GETCHECK, 0, 0) } == 1;
             st.running = true;
+            st.start_time = Some(Instant::now());
+            st.total_panels = model.panels.len();
+            st.panels_done.store(0, Ordering::Relaxed);
+            st.ops_done.store(0, Ordering::Relaxed);
+            *st.prog_cur.lock().unwrap() = (0, 100);
             st.cancel.store(false, Ordering::Relaxed);
+
+            if want_lock {
+                st.input_locked = win_ui::install_topsolid_input_lock();
+                if st.input_locked {
+                    append_log(st.hwnd_log, "TopSolid mouse/keyboard input LOCKED (click Stop to cancel & unlock).");
+                }
+            } else {
+                st.input_locked = false;
+            }
+
             unsafe {
                 EnableWindow(st.hwnd_start, 0);
                 EnableWindow(st.hwnd_stop, 1);
+                // Keep exporter window on top while running so timer, speed meter, and Stop stay reachable
+                SetWindowPos(st.hwnd_main, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                SetTimer(st.hwnd_main, ID_TIMER_METRICS, 500, None);
             }
+            set_text(st.hwnd_metrics, &format_metrics_line(st));
             append_log(
                 st.hwnd_log,
                 &format!(
@@ -216,14 +301,22 @@ mod win_gui {
                 st.pending_logs.clone(),
                 st.last_status.clone(),
                 st.prog_cur.clone(),
+                st.panels_done.clone(),
+                st.ops_done.clone(),
             )
         };
 
         let hwnd_addr = hwnd_main as usize;
+        let t_start = Instant::now();
         thread::spawn(move || {
             let hwnd = hwnd_addr as HWND;
             let res = exporter::run_export(&model, mode, auto_save, &cancel, |cur, tot, msg| {
                 *prog_cur.lock().unwrap() = (cur, tot);
+                if let Some(pidx) = parse_panel_index(msg) {
+                    panels_done.store(pidx, Ordering::Relaxed);
+                } else if msg.starts_with("Use process:") {
+                    ops_done.fetch_add(1, Ordering::Relaxed);
+                }
                 *last_status.lock().unwrap() = msg.to_string();
                 if cur == 0 || cur == tot || cur % 10 == 0 || !msg.starts_with("Use process:") {
                     pending_logs.lock().unwrap().push(format!("[{}/{}] {}", cur, tot, msg));
@@ -231,15 +324,27 @@ mod win_gui {
                 unsafe { PostMessageW(hwnd, WM_APP_PROGRESS, 0, 0) };
             });
 
+            let elapsed_s = t_start.elapsed().as_secs_f64();
+            let mins = (elapsed_s / 60.0).max(1.0 / 60.0);
             match res {
                 Ok(st) => {
+                    panels_done.store(st.panels, Ordering::Relaxed);
+                    let total_ops_done = if st.native_applied > 0 {
+                        st.native_applied
+                    } else {
+                        st.cuts + st.holes
+                    };
+                    ops_done.store(total_ops_done, Ordering::Relaxed);
                     let summary = format!(
-                        "DONE! Panels={}, Cuts={}, Holes={}, CachedVariants={}, NativeApplied={}, Errors={}{}",
+                        "DONE in {}! Panels={} ({:.1}/min), Ops={} ({:.1}/min), Cuts={}, Holes={}, CachedVariants={}, Errors={}{}",
+                        format_duration(elapsed_s as u64),
                         st.panels,
+                        st.panels as f64 / mins,
+                        total_ops_done,
+                        total_ops_done as f64 / mins,
                         st.cuts,
                         st.holes,
                         st.variants_built,
-                        st.native_applied,
                         st.errors,
                         st.saved_path
                             .as_ref()
@@ -250,7 +355,7 @@ mod win_gui {
                     pending_logs.lock().unwrap().push(summary);
                 }
                 Err(e) => {
-                    let msg = format!("STOPPED/ERROR: {}", e);
+                    let msg = format!("STOPPED/ERROR after {}: {}", format_duration(elapsed_s as u64), e);
                     *last_status.lock().unwrap() = msg.clone();
                     pending_logs.lock().unwrap().push(msg);
                 }
@@ -271,9 +376,20 @@ mod win_gui {
                 if id == ID_BTN_START {
                     start_export_worker();
                 } else if id == ID_BTN_STOP {
-                    if let Some(st) = STATE.lock().unwrap().as_ref() {
+                    win_ui::uninstall_topsolid_input_lock();
+                    if let Some(st) = STATE.lock().unwrap().as_mut() {
+                        st.input_locked = false;
                         st.cancel.store(true, Ordering::Relaxed);
-                        set_text(st.hwnd_status, "Stopping...");
+                        set_text(st.hwnd_status, "Stopping... (TopSolid input unlocked)");
+                        set_text(st.hwnd_metrics, &format_metrics_line(st));
+                    }
+                }
+                0
+            }
+            WM_TIMER => {
+                if wparam == ID_TIMER_METRICS {
+                    if let Some(st) = STATE.lock().unwrap().as_ref() {
+                        set_text(st.hwnd_metrics, &format_metrics_line(st));
                     }
                 }
                 0
@@ -283,6 +399,7 @@ mod win_gui {
                     let (cur, tot) = *st.prog_cur.lock().unwrap();
                     SendMessageW(st.hwnd_progress, PBM_SETRANGE32, 0, tot.max(1) as isize);
                     SendMessageW(st.hwnd_progress, PBM_SETPOS, cur, 0);
+                    set_text(st.hwnd_metrics, &format_metrics_line(st));
                     let status = st.last_status.lock().unwrap().clone();
                     set_text(st.hwnd_status, &status);
                     let mut logs = st.pending_logs.lock().unwrap();
@@ -293,10 +410,15 @@ mod win_gui {
                 0
             }
             WM_APP_DONE => {
+                win_ui::uninstall_topsolid_input_lock();
+                KillTimer(hwnd, ID_TIMER_METRICS);
+                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
                 if let Some(st) = STATE.lock().unwrap().as_mut() {
                     st.running = false;
+                    st.input_locked = false;
                     EnableWindow(st.hwnd_start, 1);
                     EnableWindow(st.hwnd_stop, 0);
+                    set_text(st.hwnd_metrics, &format_metrics_line(st));
                     let status = st.last_status.lock().unwrap().clone();
                     set_text(st.hwnd_status, &status);
                     let mut logs = st.pending_logs.lock().unwrap();
@@ -307,6 +429,8 @@ mod win_gui {
                 0
             }
             WM_DESTROY => {
+                win_ui::uninstall_topsolid_input_lock();
+                KillTimer(hwnd, ID_TIMER_METRICS);
                 if let Some(st) = STATE.lock().unwrap().as_ref() {
                     st.cancel.store(true, Ordering::Relaxed);
                 }
@@ -359,8 +483,8 @@ mod win_gui {
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
-                sc(640),
-                sc(480),
+                sc(660),
+                sc(520),
                 null_mut(),
                 null_mut(),
                 hinst,
@@ -427,15 +551,27 @@ mod win_gui {
                 "Auto-save .top file on completion",
                 BS_AUTOCHECKBOX as u32,
                 16,
-                98,
+                96,
                 340,
                 22,
                 ID_CHK_AUTOSAVE,
             );
             SendMessageW(hwnd_chk_save, BM_SETCHECK, 1, 0);
 
-            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 390, 94, 114, 30, ID_BTN_START);
-            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 514, 94, 94, 30, ID_BTN_STOP);
+            let hwnd_chk_lock = mk(
+                &btn_cls,
+                "Lock TopSolid mouse/keyboard during export (Stop stays active)",
+                BS_AUTOCHECKBOX as u32,
+                16,
+                122,
+                370,
+                22,
+                ID_CHK_LOCK_INPUT,
+            );
+            SendMessageW(hwnd_chk_lock, BM_SETCHECK, 1, 0);
+
+            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 410, 102, 114, 32, ID_BTN_START);
+            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 534, 102, 94, 32, ID_BTN_STOP);
             EnableWindow(hwnd_stop, 0);
 
             let hwnd_progress = CreateWindowExW(
@@ -444,38 +580,56 @@ mod win_gui {
                 null(),
                 WS_CHILD | WS_VISIBLE,
                 sc(16),
-                sc(136),
-                sc(592),
+                sc(154),
+                sc(612),
                 sc(22),
                 hwnd,
                 null_mut(),
                 hinst,
                 null(),
             );
-            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 166, 592, 22, 0);
+            let hwnd_metrics = mk(
+                &static_cls,
+                "Elapsed: 00:00  |  Speed: -- parts/min, -- ops/min  |  ETA: --:--",
+                0,
+                16,
+                184,
+                612,
+                20,
+                0,
+            );
+            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 208, 612, 20, 0);
             let hwnd_log = mk(
                 &edit_cls,
                 "",
                 WS_BORDER | WS_VSCROLL | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
                 16,
-                194,
-                592,
+                234,
+                612,
                 232,
                 0,
             );
 
             let has_model = loaded_model.is_some();
+            let total_panels = loaded_model.as_ref().map(|m| m.panels.len()).unwrap_or(0);
             *STATE.lock().unwrap() = Some(AppState {
                 hwnd_main: hwnd,
                 hwnd_radio_native,
                 hwnd_chk_save,
+                hwnd_chk_lock,
                 hwnd_progress,
+                hwnd_metrics,
                 hwnd_status,
                 hwnd_log,
                 hwnd_start,
                 hwnd_stop,
                 model: loaded_model,
                 running: false,
+                input_locked: false,
+                start_time: None,
+                total_panels,
+                panels_done: Arc::new(AtomicUsize::new(0)),
+                ops_done: Arc::new(AtomicUsize::new(0)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 pending_logs: Arc::new(Mutex::new(Vec::new())),
                 last_status: Arc::new(Mutex::new(String::new())),

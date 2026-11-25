@@ -1,18 +1,24 @@
 #![cfg(windows)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, IsWindowVisible, SetCursorPos, SetForegroundWindow, SetProcessDPIAware,
-    ShowWindow, SW_MAXIMIZE,
+    CallNextHookEx, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HHOOK,
+    IsWindowVisible, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LLMHF_INJECTED, MSLLHOOKSTRUCT,
+    SetCursorPos, SetForegroundWindow, SetProcessDPIAware, SetWindowsHookExW, ShowWindow,
+    UnhookWindowsHookEx, WindowFromPoint, SW_MAXIMIZE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
 pub fn init_dpi_aware() {
@@ -439,4 +445,120 @@ where
     tap_vk(0x1B);
     sleep(Duration::from_millis(80));
     Ok(done)
+}
+
+// ============================================================================
+// Low-level Win32 input lock for TopSolid (WH_MOUSE_LL + WH_KEYBOARD_LL)
+// Blocks physical user clicks/wheel/keys directed at TopSolid's process while
+// allowing: (1) our exporter's own synthetic SendInput/mouse_event/keybd_event
+// (LLMHF_INJECTED / LLKHF_INJECTED), and (2) clicking Stop in our own GUI.
+// Must be installed/uninstalled on the GUI thread that pumps Win32 messages.
+// ============================================================================
+
+static LOCK_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LOCK_TS_PID: AtomicU32 = AtomicU32::new(0);
+static HOOK_MOUSE: AtomicUsize = AtomicUsize::new(0);
+static HOOK_KBD: AtomicUsize = AtomicUsize::new(0);
+
+fn hwnd_belongs_to_locked_topsolid(hwnd: HWND) -> bool {
+    let ts_pid = LOCK_TS_PID.load(Ordering::Relaxed);
+    if ts_pid == 0 || hwnd.is_null() {
+        return false;
+    }
+    let mut pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, &mut pid);
+    }
+    pid == ts_pid
+}
+
+unsafe extern "system" fn ll_mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && LOCK_ACTIVE.load(Ordering::Relaxed) && lparam != 0 {
+        let ms = &*(lparam as *const MSLLHOOKSTRUCT);
+        // Only filter physical user input (never block our own synthetic injected clicks)
+        if (ms.flags & LLMHF_INJECTED) == 0 {
+            let msg = wparam as u32;
+            let is_click_or_wheel = matches!(
+                msg,
+                WM_LBUTTONDOWN
+                    | WM_LBUTTONUP
+                    | WM_RBUTTONDOWN
+                    | WM_RBUTTONUP
+                    | WM_MBUTTONDOWN
+                    | WM_MBUTTONUP
+                    | WM_MOUSEWHEEL
+                    | WM_MOUSEHWHEEL
+                    | WM_XBUTTONDOWN
+                    | WM_XBUTTONUP
+            );
+            if is_click_or_wheel {
+                let hit = WindowFromPoint(ms.pt);
+                if hwnd_belongs_to_locked_topsolid(hit) {
+                    return 1;
+                }
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wparam, lparam)
+}
+
+unsafe extern "system" fn ll_kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && LOCK_ACTIVE.load(Ordering::Relaxed) && lparam != 0 {
+        let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
+        // Only filter physical user keystrokes (never block our own synthetic SendInput/keybd_event)
+        if (kb.flags & LLKHF_INJECTED) == 0 {
+            let fg = GetForegroundWindow();
+            if hwnd_belongs_to_locked_topsolid(fg) {
+                return 1;
+            }
+        }
+    }
+    CallNextHookEx(null_mut(), code, wparam, lparam)
+}
+
+/// Install low-level hooks blocking physical mouse clicks/scroll and keyboard input in TopSolid.
+/// Returns true if TopSolid was found and hooks were installed.
+pub fn install_topsolid_input_lock() -> bool {
+    uninstall_topsolid_input_lock();
+    let Some(ts_hwnd) = find_topsolid_hwnd() else {
+        return false;
+    };
+    let mut ts_pid: u32 = 0;
+    unsafe {
+        GetWindowThreadProcessId(ts_hwnd, &mut ts_pid);
+    }
+    if ts_pid == 0 {
+        return false;
+    }
+    LOCK_TS_PID.store(ts_pid, Ordering::Relaxed);
+    unsafe {
+        let hinst = GetModuleHandleW(null_mut());
+        let hm = SetWindowsHookExW(WH_MOUSE_LL, Some(ll_mouse_proc), hinst, 0);
+        let hk = SetWindowsHookExW(WH_KEYBOARD_LL, Some(ll_kbd_proc), hinst, 0);
+        HOOK_MOUSE.store(hm as usize, Ordering::Relaxed);
+        HOOK_KBD.store(hk as usize, Ordering::Relaxed);
+        if !hm.is_null() || !hk.is_null() {
+            LOCK_ACTIVE.store(true, Ordering::Relaxed);
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove TopSolid input-lock hooks immediately. Safe to call repeatedly.
+pub fn uninstall_topsolid_input_lock() {
+    LOCK_ACTIVE.store(false, Ordering::Relaxed);
+    LOCK_TS_PID.store(0, Ordering::Relaxed);
+    let hm = HOOK_MOUSE.swap(0, Ordering::Relaxed) as HHOOK;
+    if !hm.is_null() {
+        unsafe {
+            UnhookWindowsHookEx(hm);
+        }
+    }
+    let hk = HOOK_KBD.swap(0, Ordering::Relaxed) as HHOOK;
+    if !hk.is_null() {
+        unsafe {
+            UnhookWindowsHookEx(hk);
+        }
+    }
 }
