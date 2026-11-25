@@ -2,6 +2,7 @@
 name = "bazis-to-topsolid"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Native Windows exporter from Bazis-Mebelshchik 2022 JSON to TopSolid'Wood 6.25 via COM and native process templates"
 
 [dependencies]

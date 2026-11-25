@@ -18,5 +18,6 @@ docs/api/
 topsolid-mcp/.ts6-ipc/
 bazis-to-topsolid/target/
 *.exe
+!bazis-to-topsolid/bin/bazis-to-topsolid.exe
 *.igz
 *.igz.bak

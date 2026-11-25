@@ -1,6 +1,7 @@
 {
   "name": "bazis-mcp",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "MCP server for driving Bazis-Mebelshchik 2022 over its embedded Node.js HTTP bridge",
   "type": "module",
   "bin": {
