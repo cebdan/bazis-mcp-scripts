@@ -331,18 +331,18 @@ where
         // 1. Component name + ENTER (prompt stays "Component to use:" while [PROCESS=...] pops up)
         type_unicode(cmp);
         tap_vk(0x0D);
-        sleep(Duration::from_millis(160));
+        sleep(Duration::from_millis(240));
 
         // 2. Click [PROCESS=...] button at (445, 263)
         let before_proc = prompt_hwnd.map(get_window_text).unwrap_or_default();
         click(445, 263);
-        let _ = wait_prompt_change(prompt_hwnd, &before_proc, 260);
-        sleep(Duration::from_millis(40));
+        let _ = wait_prompt_change(prompt_hwnd, &before_proc, 300);
+        sleep(Duration::from_millis(60));
 
         // 3. Target panel name + ENTER
         type_unicode(panel);
         tap_vk(0x0D);
-        sleep(Duration::from_millis(180));
+        sleep(Duration::from_millis(220));
 
         // 4. Second ENTER to confirm and execute the native TopSolid'Wood operation
         tap_vk(0x0D);

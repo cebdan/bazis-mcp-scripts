@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crate::com::{ComArg, ComGuard, ComObj};
-use crate::model::{BazisExportModel, ContourLoop, CurveSeg, Vec3};
+use crate::model::{BazisExportModel, ContourLoop, CurveSeg, HoleOp, Vec3};
 use crate::win_ui::{apply_use_process_batch, modify_active_doc_params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +79,20 @@ fn patch_ascii_top_params(
             while end < lines.len() && lines[end] != "}" {
                 end += 1;
             }
-            if end < lines.len() && i + 28 < end && lines[i + 5] == "S1" {
+            if end < lines.len() && i + 7 < end && lines[i + 5] == "S1" {
                 let pname = lines[i + 6].as_str();
                 if let Some((_, _, val_m)) = params.iter().find(|(k, _, _)| k == pname) {
-                    if lines[i + 27].starts_with('R') && lines[i + 28].starts_with('R') {
-                        let rval = format!("R{}", fmt_meters(*val_m));
-                        lines[i + 27] = rval.clone();
-                        lines[i + 28] = rval;
-                        matched += 1;
+                    // Universal offset: first "S0" inside {D_PARAM} is followed at +4 and +5 by the two R<val> lines
+                    if let Some(s0) = (i + 7..end).find(|&k| lines[k] == "S0") {
+                        if s0 + 5 < end
+                            && lines[s0 + 4].starts_with('R')
+                            && lines[s0 + 5].starts_with('R')
+                        {
+                            let rval = format!("R{}", fmt_meters(*val_m));
+                            lines[s0 + 4] = rval.clone();
+                            lines[s0 + 5] = rval;
+                            matched += 1;
+                        }
                     }
                 }
             }
@@ -133,6 +139,7 @@ fn resolve_templates_dir(hint: &str) -> PathBuf {
 fn find_base_templates(dir: &Path) -> HashMap<String, String> {
     let pairs = [
         ("drill", "B&S_Drill.top"),
+        ("drillrow", "B&S_DrillRow.top"),
         ("groove", "B&S_Groove.top"),
         ("pocket", "B&S_Pocket.top"),
         ("rabbet", "B&S_Rabbet.top"),
@@ -146,6 +153,159 @@ fn find_base_templates(dir: &Path) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn v_sub(a: &Vec3, b: &Vec3) -> Vec3 {
+    Vec3 { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z }
+}
+fn v_dot(a: &Vec3, b: &Vec3) -> f64 {
+    a.x * b.x + a.y * b.y + a.z * b.z
+}
+fn v_cross(a: &Vec3, b: &Vec3) -> Vec3 {
+    Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+fn v_len(a: &Vec3) -> f64 {
+    v_dot(a, a).sqrt()
+}
+fn v_norm(a: &Vec3) -> Vec3 {
+    let l = v_len(a);
+    if l < 1e-12 { Vec3 { x: 1.0, y: 0.0, z: 0.0 } } else { Vec3 { x: a.x / l, y: a.y / l, z: a.z / l } }
+}
+
+enum HoleGroup {
+    Single(usize),
+    Row {
+        entry: Vec3,
+        ax_x: Vec3,
+        ax_y: Vec3,
+        diam_mm: f64,
+        depth_mm: f64,
+        count: usize,
+        step_mm: f64,
+    },
+}
+
+/// Automatically group collinear equal-step holes of identical diameter, depth, and face normal
+/// into universal linear drill rows (N >= 2) so 1 Use process creates the entire row.
+fn group_holes_into_rows(holes: &[HoleOp], allow_rows: bool) -> Vec<HoleGroup> {
+    if !allow_rows || holes.len() < 2 {
+        return (0..holes.len()).map(HoleGroup::Single).collect();
+    }
+    let n = holes.len();
+    let mut used = vec![false; n];
+    let mut groups: Vec<HoleGroup> = Vec::new();
+
+    loop {
+        let mut best_chain: Vec<usize> = Vec::new();
+        let mut best_step: f64 = f64::MAX;
+        let mut best_dir = Vec3 { x: 1.0, y: 0.0, z: 0.0 };
+
+        for i in 0..n {
+            if used[i] { continue; }
+            let hi = &holes[i];
+            for j in 0..n {
+                if i == j || used[j] { continue; }
+                let hj = &holes[j];
+                if (hi.diam_mm - hj.diam_mm).abs() > 0.05 || (hi.depth_mm - hj.depth_mm).abs() > 0.05 {
+                    continue;
+                }
+                if v_dot(&hi.dir, &hj.dir) < 0.999 {
+                    continue;
+                }
+                let diff = v_sub(&hj.entry, &hi.entry);
+                if v_dot(&diff, &hi.dir).abs() > 0.0005 {
+                    continue;
+                }
+                let step = v_len(&diff);
+                if step < 0.003 || step > 1.5 {
+                    continue;
+                }
+                let u = Vec3 { x: diff.x / step, y: diff.y / step, z: diff.z / step };
+                // Ensure no unused hole exists one step BEFORE i along -u (so we start from row endpoint)
+                let prev_pt = Vec3 {
+                    x: hi.entry.x - u.x * step,
+                    y: hi.entry.y - u.y * step,
+                    z: hi.entry.z - u.z * step,
+                };
+                let has_prev = (0..n).any(|k| {
+                    !used[k]
+                        && k != i
+                        && (holes[k].diam_mm - hi.diam_mm).abs() <= 0.05
+                        && (holes[k].depth_mm - hi.depth_mm).abs() <= 0.05
+                        && v_dot(&holes[k].dir, &hi.dir) >= 0.999
+                        && v_len(&v_sub(&holes[k].entry, &prev_pt)) < 0.0006
+                });
+                if has_prev {
+                    continue;
+                }
+
+                let mut chain = vec![i, j];
+                let mut mult = 2usize;
+                loop {
+                    let target = Vec3 {
+                        x: hi.entry.x + u.x * (step * mult as f64),
+                        y: hi.entry.y + u.y * (step * mult as f64),
+                        z: hi.entry.z + u.z * (step * mult as f64),
+                    };
+                    let next_idx = (0..n).find(|&k| {
+                        !used[k]
+                            && !chain.contains(&k)
+                            && (holes[k].diam_mm - hi.diam_mm).abs() <= 0.05
+                            && (holes[k].depth_mm - hi.depth_mm).abs() <= 0.05
+                            && v_dot(&holes[k].dir, &hi.dir) >= 0.999
+                            && v_len(&v_sub(&holes[k].entry, &target)) < 0.0006
+                    });
+                    match next_idx {
+                        Some(k) => {
+                            chain.push(k);
+                            mult += 1;
+                        }
+                        None => break,
+                    }
+                }
+
+                if chain.len() > best_chain.len()
+                    || (chain.len() == best_chain.len() && chain.len() >= 2 && step < best_step - 1e-5)
+                {
+                    best_chain = chain;
+                    best_step = step;
+                    best_dir = u;
+                }
+            }
+        }
+
+        if best_chain.len() < 2 {
+            break;
+        }
+        let h0 = &holes[best_chain[0]];
+        let out_z = v_norm(&Vec3 { x: -h0.dir.x, y: -h0.dir.y, z: -h0.dir.z });
+        let ax_x = v_norm(&best_dir);
+        let ax_y = v_norm(&v_cross(&out_z, &ax_x));
+        let step_mm = (best_step * 1000.0 * 10.0).round() / 10.0;
+        for &idx in &best_chain {
+            used[idx] = true;
+        }
+        groups.push(HoleGroup::Row {
+            entry: h0.entry.clone(),
+            ax_x,
+            ax_y,
+            diam_mm: h0.diam_mm,
+            depth_mm: h0.depth_mm,
+            count: best_chain.len(),
+            step_mm,
+        });
+    }
+
+    for i in 0..n {
+        if !used[i] {
+            groups.push(HoleGroup::Single(i));
+        }
+    }
+    groups
 }
 
 fn build_loop_curve(
@@ -249,11 +409,19 @@ where
         HashMap::new()
     };
 
+    let allow_rows = mode == ExportMode::NativeTemplates && base_tpls.contains_key("drillrow");
+    let panel_hole_groups: Vec<Vec<HoleGroup>> = model
+        .panels
+        .iter()
+        .map(|p| group_holes_into_rows(&p.holes, allow_rows))
+        .collect();
+    let total_hole_ops: usize = panel_hole_groups.iter().map(|g| g.len()).sum();
+
     // Collect unique exact-size native template variants needed by this model
     let mut variant_seen: HashMap<String, bool> = HashMap::new();
     let mut variants: Vec<VariantSpec> = Vec::new();
     if mode == ExportMode::NativeTemplates {
-        for p in &model.panels {
+        for (p_idx, p) in model.panels.iter().enumerate() {
             for c in &p.cuts {
                 if let Some(src) = base_tpls.get(&c.op_kind) {
                     let (key, params) = if c.op_kind == "pocket" {
@@ -301,24 +469,65 @@ where
                     }
                 }
             }
-            for h in &p.holes {
-                if let Some(src) = base_tpls.get("drill") {
-                    let key = format!("{}x{}", num_key(h.diam_mm), num_key(h.depth_mm));
-                    let dst = cache_dir
-                        .join(format!("B&S_drill_{}.top", key))
-                        .to_string_lossy()
-                        .to_string();
-                    if !variant_seen.contains_key(&dst) {
-                        variant_seen.insert(dst.clone(), true);
-                        if !Path::new(&dst).exists() {
-                            variants.push(VariantSpec {
-                                src: src.clone(),
-                                dst,
-                                params: vec![
-                                    ("D".into(), format!("{}mm", h.diam_mm), h.diam_mm * 0.001),
-                                    ("H".into(), format!("{}mm", h.depth_mm), h.depth_mm * 0.001),
-                                ],
-                            });
+            for grp in &panel_hole_groups[p_idx] {
+                match grp {
+                    HoleGroup::Single(hi) => {
+                        let h = &p.holes[*hi];
+                        if let Some(src) = base_tpls.get("drill") {
+                            let key = format!("{}x{}", num_key(h.diam_mm), num_key(h.depth_mm));
+                            let dst = cache_dir
+                                .join(format!("B&S_drill_{}.top", key))
+                                .to_string_lossy()
+                                .to_string();
+                            if !variant_seen.contains_key(&dst) {
+                                variant_seen.insert(dst.clone(), true);
+                                if !Path::new(&dst).exists() {
+                                    variants.push(VariantSpec {
+                                        src: src.clone(),
+                                        dst,
+                                        params: vec![
+                                            ("D".into(), format!("{}mm", h.diam_mm), h.diam_mm * 0.001),
+                                            ("H".into(), format!("{}mm", h.depth_mm), h.depth_mm * 0.001),
+                                        ],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    HoleGroup::Row {
+                        diam_mm,
+                        depth_mm,
+                        count,
+                        step_mm,
+                        ..
+                    } => {
+                        if let Some(src) = base_tpls.get("drillrow") {
+                            let key = format!(
+                                "{}x{}x{}x{}",
+                                num_key(*diam_mm),
+                                num_key(*depth_mm),
+                                count,
+                                num_key(*step_mm)
+                            );
+                            let dst = cache_dir
+                                .join(format!("B&S_drillrow_{}.top", key))
+                                .to_string_lossy()
+                                .to_string();
+                            if !variant_seen.contains_key(&dst) {
+                                variant_seen.insert(dst.clone(), true);
+                                if !Path::new(&dst).exists() {
+                                    variants.push(VariantSpec {
+                                        src: src.clone(),
+                                        dst,
+                                        params: vec![
+                                            ("D".into(), format!("{}mm", diam_mm), diam_mm * 0.001),
+                                            ("H".into(), format!("{}mm", depth_mm), depth_mm * 0.001),
+                                            ("N".into(), format!("{}", count), *count as f64),
+                                            ("Step".into(), format!("{}mm", step_mm), step_mm * 0.001),
+                                        ],
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -326,7 +535,7 @@ where
         }
     }
 
-    let total_ops = model.total_cuts() + model.total_holes();
+    let total_ops = model.total_cuts() + total_hole_ops;
     let total_units = variants.len()
         + model.panels.len()
         + total_ops
@@ -380,6 +589,9 @@ where
             }
             let cur = app.get_obj("CurrentDocument")?;
             let cur_doc = cur.get_obj("Document")?;
+            if patched_ascii {
+                let _ = cur_doc.call("Regenerate", &[]);
+            }
             let _ = cur_doc.call("Save", &[])?;
             let _ = cur_doc.call("Close", &[ComArg::Bool(false), ComArg::Bool(false)]);
             stats.variants_built += 1;
@@ -654,31 +866,59 @@ where
             progress += 1;
         }
 
-        // Drilling holes
-        for h in &p.holes {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Stopped by user during hole placement.".into());
-            }
-            if mode == ExportMode::NativeTemplates && base_tpls.contains_key("drill") {
-                let key = format!("{}x{}", num_key(h.diam_mm), num_key(h.depth_mm));
-                let tpl_file = cache_dir
-                    .join(format!("B&S_drill_{}.top", key))
-                    .to_string_lossy()
-                    .to_string();
+        // Drilling holes (with automatic collinear row grouping via B&S_DrillRow.top)
+        if mode == ExportMode::NativeTemplates && base_tpls.contains_key("drill") {
+            for grp in &panel_hole_groups[idx] {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Stopped by user during hole placement.".into());
+                }
+                let (tpl_file, entry, ax_x, ax_y, hole_cnt) = match grp {
+                    HoleGroup::Single(hi) => {
+                        let h = &p.holes[*hi];
+                        let key = format!("{}x{}", num_key(h.diam_mm), num_key(h.depth_mm));
+                        let f = cache_dir
+                            .join(format!("B&S_drill_{}.top", key))
+                            .to_string_lossy()
+                            .to_string();
+                        (f, &h.entry, &h.tpl_ax_x, &h.tpl_ax_y, 1usize)
+                    }
+                    HoleGroup::Row {
+                        entry,
+                        ax_x,
+                        ax_y,
+                        diam_mm,
+                        depth_mm,
+                        count,
+                        step_mm,
+                    } => {
+                        let key = format!(
+                            "{}x{}x{}x{}",
+                            num_key(*diam_mm),
+                            num_key(*depth_mm),
+                            count,
+                            num_key(*step_mm)
+                        );
+                        let f = cache_dir
+                            .join(format!("B&S_drillrow_{}.top", key))
+                            .to_string_lossy()
+                            .to_string();
+                        (f, entry, ax_x, ax_y, *count)
+                    }
+                };
                 op_seq += 1;
                 let cmp_name = format!("Op{}", op_seq);
                 let cs_res = csystems.call_obj(
                     "AddBasic",
                     &[
-                        ComArg::F64(h.entry.x),
-                        ComArg::F64(h.entry.y),
-                        ComArg::F64(h.entry.z),
-                        ComArg::F64(h.tpl_ax_x.x),
-                        ComArg::F64(h.tpl_ax_x.y),
-                        ComArg::F64(h.tpl_ax_x.z),
-                        ComArg::F64(h.tpl_ax_y.x),
-                        ComArg::F64(h.tpl_ax_y.y),
-                        ComArg::F64(h.tpl_ax_y.z),
+                        ComArg::F64(entry.x),
+                        ComArg::F64(entry.y),
+                        ComArg::F64(entry.z),
+                        ComArg::F64(ax_x.x),
+                        ComArg::F64(ax_x.y),
+                        ComArg::F64(ax_x.z),
+                        ComArg::F64(ax_y.x),
+                        ComArg::F64(ax_y.y),
+                        ComArg::F64(ax_y.z),
                     ],
                 );
                 if let Ok(cs) = cs_res {
@@ -694,14 +934,20 @@ where
                             let _ = el.put("Name", ComArg::Str(&cmp_name));
                         }
                         apply_pairs.push((cmp_name, ts_panel_name.clone()));
-                        stats.holes += 1;
+                        stats.holes += hole_cnt;
                     } else {
                         stats.errors += 1;
                     }
                 } else {
                     stats.errors += 1;
                 }
-            } else if let Some(ref ops) = blk_ops {
+                progress += 1;
+            }
+        } else if let Some(ref ops) = blk_ops {
+            for h in &p.holes {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Stopped by user during hole placement.".into());
+                }
                 if let Ok(circ) = curves.call_obj(
                     "AddBasicCircle",
                     &[
@@ -755,8 +1001,8 @@ where
                 } else {
                     stats.errors += 1;
                 }
+                progress += 1;
             }
-            progress += 1;
         }
 
         if mode == ExportMode::NativeTemplates && p.layer != 0 {
