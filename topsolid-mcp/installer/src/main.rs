@@ -135,22 +135,8 @@ mod win_setup {
     }
 
     fn default_paths() -> (PathBuf, PathBuf, PathBuf) {
-        let local_app = std::env::var("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(r"C:\TopSolid6MCP"));
-
-        let shared_repo = PathBuf::from(r"Y:\Works\cnc\topsolid-mcp");
-        let install_dir = if shared_repo.exists() {
-            shared_repo.clone()
-        } else {
-            local_app.join("TopSolid6MCP")
-        };
-
-        let ipc_dir = if shared_repo.exists() {
-            shared_repo.join(".ts6-ipc")
-        } else {
-            install_dir.join(".ts6-ipc")
-        };
+        let install_dir = PathBuf::from(r"C:\Missler\mcp");
+        let ipc_dir = install_dir.join(".ts6-ipc");
 
         let shared_tpl = PathBuf::from(r"Y:\Works\bazis\TopSolid_Templates");
         let templates_dir = if shared_tpl.exists() {

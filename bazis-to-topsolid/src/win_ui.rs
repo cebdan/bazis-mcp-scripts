@@ -570,7 +570,10 @@ pub fn uninstall_topsolid_input_lock() {
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn resolve_mcp_bridge_ps1() -> Option<std::path::PathBuf> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from(r"C:\Missler\mcp\agent\ts6_bridge.ps1"),
+        std::path::PathBuf::from(r"C:\Missler\mcp\topsolid-mcp\agent\ts6_bridge.ps1"),
+    ];
     if let Ok(exe) = std::env::current_exe() {
         if let Some(scripts_dir) = exe.parent() {
             if let Some(bazis_dir) = scripts_dir.parent() {
