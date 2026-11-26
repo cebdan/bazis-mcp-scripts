@@ -1,8 +1,8 @@
 {
   "name": "topsolid-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "released": "2026-11-26",
   "repo": "cebdan/bazis-mcp-scripts",
   "branch": "main",
-  "changelog": "Standalone Windows Setup EXE with automatic Node.js LTS installation, Antigravity mcp_config.json auto-configuration, end-to-end MCP verification, 200% DPI tray UI, Task Scheduler service, Start Menu section, and GitHub updater."
+  "changelog": "Default install dir C:\\Missler\\mcp, multi-version TopSolid 6.xx selector, on-machine B&S_*.top template builder (ts6_build_templates.ps1) with Rebuild Templates button in Setup and Tray Settings, plus bazis-to-topsolid.exe with TopSolid_Lib_Bazis hardware components, live timer/speed meter, and input lock."
 }
