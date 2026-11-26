@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Zero-dependency MCP stdio server for TopSolid'Wood 6.25 (COM Automation via Shared-Folder IPC).
+// Zero-dependency MCP stdio server for TopSolid (COM Automation via Shared-Folder IPC).
 // Works on macOS (synced via MEGA) or Windows.
 
 import fs from "node:fs";
@@ -11,30 +11,46 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const IPC_DIR = process.env.TS6_IPC_DIR || path.join(REPO_ROOT, ".ts6-ipc");
 const TIMEOUT_MS = Number(process.env.TS6_TIMEOUT_MS || 30000);
 
+let SERVER_VERSION = "0.2.0";
+try {
+  const vMeta = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "version.json"), "utf8"));
+  if (vMeta?.version) SERVER_VERSION = String(vMeta.version);
+} catch {}
+
 const TOOLS = [
   {
     name: "ts6_health",
-    description: "Check live COM connection to TopSolid'Wood 6.25, version, open document count, and active document name.",
+    description: "Check live COM connection to TopSolid, version, open document count, and active document name.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "ts6_bridge_info",
+    description: "Get TopSolid MCP bridge version, PID, uptime, request/error counters, Windows service & Start Menu installation status, paths, and last GitHub update check.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "ts6_check_updates",
+    description: "Check GitHub for newer versions or commits of topsolid-mcp and compare against the running bridge version.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "ts6_list_templates",
-    description: "List available TopSolid'Wood 6.25 .top process templates in TopSolid_Templates.",
+    description: "List available TopSolid .top process templates in TopSolid_Templates.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "ts6_new_doc",
-    description: "Create a new empty TopSolid 6.25 design document (.top).",
+    description: "Create a new empty TopSolid design document (.top).",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "ts6_list_elements",
-    description: "List all shapes (panels, designations, layers, operation counts) and inserted components in the active TopSolid 6.25 document.",
+    description: "List all shapes (panels, designations, layers, operation counts) and inserted components in the active TopSolid document.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "ts6_create_block",
-    description: "Create a native Parasolid rectangular panel (AddBasicBlock) in the active TopSolid 6.25 document (coordinates and dimensions in mm).",
+    description: "Create a native Parasolid rectangular panel (AddBasicBlock) in the active TopSolid document (coordinates and dimensions in mm).",
     inputSchema: {
       type: "object",
       properties: {
@@ -51,7 +67,7 @@ const TOOLS = [
   },
   {
     name: "ts6_insert_component",
-    description: "Insert a TopSolid'Wood 6.25 .top process component (Drilling, Groove, Pocket, Rabbet, Moulding) at a 3D coordinate system (in mm).",
+    description: "Insert a TopSolid .top process component (Drilling, Groove, Pocket, Rabbet, Moulding) at a 3D coordinate system (in mm).",
     inputSchema: {
       type: "object",
       properties: {
@@ -80,22 +96,22 @@ const TOOLS = [
   },
   {
     name: "ts6_focus_window",
-    description: "Bring TopSolid 6.25 (top625) window to foreground and return its screen bounding box (left, top, width, height).",
+    description: "Bring the TopSolid window to foreground and return its screen bounding box (left, top, width, height).",
     inputSchema: {
       type: "object",
       properties: {
-        process: { type: "string", description: "Process name (default 'top625')." },
+        process: { type: "string", description: "Optional process name (auto-detects running TopSolid if omitted)." },
       },
       additionalProperties: false,
     },
   },
   {
     name: "ts6_screenshot",
-    description: "Capture a PNG screenshot of the Windows screen or TopSolid 6.25 window and return it as image/png plus pixel bounds.",
+    description: "Capture a PNG screenshot of the Windows screen or TopSolid window and return it as image/png plus pixel bounds.",
     inputSchema: {
       type: "object",
       properties: {
-        windowOnly: { type: "boolean", description: "Capture only the TopSolid 6.25 window instead of the full screen." },
+        windowOnly: { type: "boolean", description: "Capture only the TopSolid window instead of the full screen." },
       },
       additionalProperties: false,
     },
@@ -152,7 +168,7 @@ function ipcCall(cmd, params) {
       } else if (Date.now() - start > TIMEOUT_MS) {
         clearInterval(timer);
         try { fs.unlinkSync(reqFinal); } catch {}
-        reject(new Error(`TopSolid 6 bridge timeout (${TIMEOUT_MS}ms). Make sure Start_TopSolid6_Bridge.bat is running on Windows.`));
+        reject(new Error(`TopSolid MCP bridge timeout (${TIMEOUT_MS}ms). Make sure TopSolid MCP Bridge is running on Windows.`));
       }
     }, 30);
   });
@@ -160,6 +176,14 @@ function ipcCall(cmd, params) {
 
 if (process.argv.includes("--health")) {
   ipcCall("health", {})
+    .then((r) => { console.log(JSON.stringify(r, null, 2)); process.exit(0); })
+    .catch((e) => { console.error(e.message); process.exit(1); });
+} else if (process.argv.includes("--info")) {
+  ipcCall("bridge_info", {})
+    .then((r) => { console.log(JSON.stringify(r, null, 2)); process.exit(0); })
+    .catch((e) => { console.error(e.message); process.exit(1); });
+} else if (process.argv.includes("--check-updates")) {
+  ipcCall("check_updates", {})
     .then((r) => { console.log(JSON.stringify(r, null, 2)); process.exit(0); })
     .catch((e) => { console.error(e.message); process.exit(1); });
 } else {
@@ -181,7 +205,7 @@ if (process.argv.includes("--health")) {
           result: {
             protocolVersion: params?.protocolVersion || "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "topsolid-mcp", version: "0.1.0" },
+            serverInfo: { name: "topsolid-mcp", version: SERVER_VERSION },
           },
         }) + "\n");
       } else if (method === "tools/list") {

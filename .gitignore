@@ -16,8 +16,10 @@ Thumbs.db
 *.bxf2
 docs/api/
 topsolid-mcp/.ts6-ipc/
+topsolid-mcp/installer/target/
 bazis-to-topsolid/target/
 *.exe
 !bazis-to-topsolid/bin/bazis-to-topsolid.exe
+!topsolid-mcp/TopSolid_MCP_Setup.exe
 *.igz
 *.igz.bak

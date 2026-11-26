@@ -1,4 +1,4 @@
-# TopSolid'Wood 6.25 Native Process Engine (Zero-dependency PowerShell 5.1)
+# TopSolid Native Process Engine (Zero-dependency PowerShell 5.1)
 # 1. Generates cached exact-size native .top process variants (Parameter -> Modify parameter via Unicode SendInput)
 # 2. Batch-applies Assembly -> Use process for every (cmpName, panelName) pair so every panel receives
 #    100% native TopSolid'Wood operations (Wood -> Drilling / Groove / Pocket / Rabbet / Moulding)
@@ -70,8 +70,8 @@ public static class Ts6NativeUI {
 [Ts6NativeUI]::SetProcessDPIAware() | Out-Null
 
 function Focus-TopSolid {
-    $p = Get-Process top625 -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if (-not $p) { throw "TopSolid 6.25 window (top625) not found" }
+    $p = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '^top6\d{2}$' -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if (-not $p) { throw "TopSolid window not found" }
     [Ts6NativeUI]::ShowWindow($p.MainWindowHandle, 3) | Out-Null
     [Ts6NativeUI]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
     Start-Sleep -Milliseconds 180
