@@ -53,6 +53,7 @@ fn main() {
             exporter::ExportMode::NativeTemplates
         };
         let auto_save = args.iter().any(|a| a == "--save");
+        let include_hardware = !args.iter().any(|a| a == "--no-hardware");
         match load_model(&json_path) {
             Ok(mut m) => {
                 if let Some(pos) = args.iter().position(|a| a == "--out") {
@@ -61,16 +62,25 @@ fn main() {
                     }
                 }
                 let cancel = std::sync::atomic::AtomicBool::new(false);
-                match exporter::run_export(&m, mode, auto_save || !m.save_top_path.is_empty(), &cancel, |d, t, msg| {
-                    println!("[{}/{}] {}", d, t, msg);
-                }) {
+                match exporter::run_export(
+                    &m,
+                    mode,
+                    auto_save || !m.save_top_path.is_empty(),
+                    include_hardware,
+                    &cancel,
+                    |d, t, msg| {
+                        println!("[{}/{}] {}", d, t, msg);
+                    },
+                ) {
                     Ok(st) => println!(
-                        "OK|panels={}|cuts={}|holes={}|variants={}|applied={}|errors={}|saved={}",
+                        "OK|panels={}|cuts={}|holes={}|variants={}|applied={}|hw_gen={}|hw_placed={}|errors={}|saved={}",
                         st.panels,
                         st.cuts,
                         st.holes,
                         st.variants_built,
                         st.native_applied,
+                        st.hardware_generated,
+                        st.hardware_placed,
                         st.errors,
                         st.saved_path.unwrap_or_default()
                     ),
@@ -135,6 +145,7 @@ mod win_gui {
     const ID_BTN_START: usize = 104;
     const ID_BTN_STOP: usize = 105;
     const ID_CHK_LOCK_INPUT: usize = 106;
+    const ID_CHK_HARDWARE: usize = 107;
     const ID_TIMER_METRICS: usize = 1;
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
@@ -146,6 +157,7 @@ mod win_gui {
         hwnd_radio_native: HWND,
         hwnd_chk_save: HWND,
         hwnd_chk_lock: HWND,
+        hwnd_chk_hw: HWND,
         hwnd_progress: HWND,
         hwnd_metrics: HWND,
         hwnd_status: HWND,
@@ -279,7 +291,7 @@ mod win_gui {
             return;
         }
 
-        let (hwnd_main, model, mode, auto_save, want_lock, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
+        let (hwnd_main, model, mode, auto_save, want_lock, include_hw, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
             let mut guard = STATE.lock().unwrap();
             let st = match guard.as_mut() {
                 Some(s) => s,
@@ -295,6 +307,7 @@ mod win_gui {
             let is_native = unsafe { SendMessageW(st.hwnd_radio_native, BM_GETCHECK, 0, 0) } == 1;
             let auto_save = unsafe { SendMessageW(st.hwnd_chk_save, BM_GETCHECK, 0, 0) } == 1;
             let want_lock = unsafe { SendMessageW(st.hwnd_chk_lock, BM_GETCHECK, 0, 0) } == 1;
+            let include_hw = unsafe { SendMessageW(st.hwnd_chk_hw, BM_GETCHECK, 0, 0) } == 1;
             st.running = true;
             st.input_locked = false;
             st.start_time = Some(Instant::now());
@@ -330,6 +343,7 @@ mod win_gui {
                 },
                 auto_save,
                 want_lock,
+                include_hw,
                 st.cancel.clone(),
                 st.pending_logs.clone(),
                 st.last_status.clone(),
@@ -365,7 +379,7 @@ mod win_gui {
                 unsafe { PostMessageW(hwnd, WM_APP_LOCK_TOPSOLID, 0, 0) };
             }
 
-            let res = exporter::run_export(&model, mode, auto_save, &cancel, |cur, tot, msg| {
+            let res = exporter::run_export(&model, mode, auto_save, include_hw, &cancel, |cur, tot, msg| {
                 *prog_cur.lock().unwrap() = (cur, tot);
                 if let Some(pidx) = parse_panel_index(msg) {
                     panels_done.store(pidx, Ordering::Relaxed);
@@ -391,15 +405,14 @@ mod win_gui {
                     };
                     ops_done.store(total_ops_done, Ordering::Relaxed);
                     let summary = format!(
-                        "DONE in {}! Panels={} ({:.1}/min), Ops={} ({:.1}/min), Cuts={}, Holes={}, CachedVariants={}, Errors={}{}",
+                        "DONE in {}! Panels={} ({:.1}/min), Ops={} ({:.1}/min), Hardware={} (new lib: {}), Errors={}{}",
                         format_duration(elapsed_s as u64),
                         st.panels,
                         st.panels as f64 / mins,
                         total_ops_done,
                         total_ops_done as f64 / mins,
-                        st.cuts,
-                        st.holes,
-                        st.variants_built,
+                        st.hardware_placed,
+                        st.hardware_generated,
                         st.errors,
                         st.saved_path
                             .as_ref()
@@ -551,7 +564,7 @@ mod win_gui {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 sc(660),
-                sc(520),
+                sc(548),
                 null_mut(),
                 null_mut(),
                 hinst,
@@ -574,11 +587,12 @@ mod win_gui {
                 Some(ref p) => match load_model(&p.to_string_lossy()) {
                     Ok(m) => {
                         let s = format!(
-                            "Model: {}   |   Panels: {}   |   Grooves/Pockets: {}   |   Holes: {}",
+                            "Model: {}   |   Panels: {}   |   Cuts: {}   |   Holes: {}   |   Hardware: {}",
                             m.model_name,
                             m.panels.len(),
                             m.total_cuts(),
-                            m.total_holes()
+                            m.total_holes(),
+                            m.hardware.len()
                         );
                         (Some(m), s)
                     }
@@ -631,14 +645,26 @@ mod win_gui {
                 BS_AUTOCHECKBOX as u32,
                 16,
                 122,
-                370,
+                380,
                 22,
                 ID_CHK_LOCK_INPUT,
             );
             SendMessageW(hwnd_chk_lock, BM_SETCHECK, 1, 0);
 
-            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 410, 102, 114, 32, ID_BTN_START);
-            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 534, 102, 94, 32, ID_BTN_STOP);
+            let hwnd_chk_hw = mk(
+                &btn_cls,
+                "Export hardware as components (auto-library: TopSolid_Lib_Bazis)",
+                BS_AUTOCHECKBOX as u32,
+                16,
+                148,
+                380,
+                22,
+                ID_CHK_HARDWARE,
+            );
+            SendMessageW(hwnd_chk_hw, BM_SETCHECK, 1, 0);
+
+            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 410, 114, 114, 34, ID_BTN_START);
+            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 534, 114, 94, 34, ID_BTN_STOP);
             EnableWindow(hwnd_stop, 0);
 
             let hwnd_progress = CreateWindowExW(
@@ -647,7 +673,7 @@ mod win_gui {
                 null(),
                 WS_CHILD | WS_VISIBLE,
                 sc(16),
-                sc(154),
+                sc(180),
                 sc(612),
                 sc(22),
                 hwnd,
@@ -660,18 +686,18 @@ mod win_gui {
                 "Elapsed: 00:00  |  Speed: -- parts/min, -- ops/min  |  ETA: --:--",
                 0,
                 16,
-                184,
+                210,
                 612,
                 20,
                 0,
             );
-            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 208, 612, 20, 0);
+            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 234, 612, 20, 0);
             let hwnd_log = mk(
                 &edit_cls,
                 "",
                 WS_BORDER | WS_VSCROLL | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
                 16,
-                234,
+                260,
                 612,
                 232,
                 0,
@@ -684,6 +710,7 @@ mod win_gui {
                 hwnd_radio_native,
                 hwnd_chk_save,
                 hwnd_chk_lock,
+                hwnd_chk_hw,
                 hwnd_progress,
                 hwnd_metrics,
                 hwnd_status,

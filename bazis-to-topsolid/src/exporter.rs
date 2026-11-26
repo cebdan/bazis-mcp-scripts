@@ -8,7 +8,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use crate::com::{ComArg, ComGuard, ComObj};
-use crate::model::{BazisExportModel, ContourLoop, CurveSeg, HoleOp, Vec3};
+use crate::model::{BazisExportModel, ContourLoop, CurveSeg, HardwareItem, HoleOp, Vec3};
 use crate::win_ui::{apply_use_process_batch, modify_active_doc_params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct ExportStats {
     pub holes: usize,
     pub variants_built: usize,
     pub native_applied: usize,
+    pub hardware_generated: usize,
+    pub hardware_placed: usize,
     pub errors: usize,
     pub saved_path: Option<String>,
 }
@@ -386,10 +388,216 @@ fn build_loop_curve(
     )
 }
 
+#[derive(Debug, Clone)]
+struct HardwareMapEntry {
+    path: String,
+    has_process: bool,
+}
+
+fn resolve_hardware_lib_dir(model_dir: &str, tpl_dir: &Path) -> PathBuf {
+    if !model_dir.is_empty() {
+        return PathBuf::from(model_dir);
+    }
+    if let Some(parent) = tpl_dir.parent() {
+        return parent.join("TopSolid_Lib_Bazis");
+    }
+    PathBuf::from(r"Y:\Works\bazis\TopSolid_Lib_Bazis")
+}
+
+/// Load optional `<templates_dir>\hardware_map.json` mapping Bazis hardware names to vendor .top files.
+/// Accepts either `"Key": "C:\\path\\file.top"` or `"Key": { "path": "...", "hasProcess": true }`.
+fn load_hardware_map(tpl_dir: &Path) -> Vec<(String, HardwareMapEntry)> {
+    let map_path = tpl_dir.join("hardware_map.json");
+    let Ok(raw) = fs::read_to_string(&map_path) else {
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(obj) = val.as_object() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (k, v) in obj {
+        if let Some(s) = v.as_str() {
+            let p = if Path::new(s).is_absolute() {
+                s.to_string()
+            } else {
+                tpl_dir.join(s).to_string_lossy().to_string()
+            };
+            out.push((
+                k.to_ascii_lowercase(),
+                HardwareMapEntry {
+                    path: p,
+                    has_process: false,
+                },
+            ));
+        } else if let Some(m) = v.as_object() {
+            if let Some(s) = m.get("path").and_then(|x| x.as_str()) {
+                let p = if Path::new(s).is_absolute() {
+                    s.to_string()
+                } else {
+                    tpl_dir.join(s).to_string_lossy().to_string()
+                };
+                let has_proc = m.get("hasProcess").and_then(|x| x.as_bool()).unwrap_or(false);
+                out.push((
+                    k.to_ascii_lowercase(),
+                    HardwareMapEntry {
+                        path: p,
+                        has_process: has_proc,
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+fn resolve_hardware_component(
+    hw: &HardwareItem,
+    hw_map: &[(String, HardwareMapEntry)],
+    hw_lib_dir: &Path,
+) -> (String, bool, bool) {
+    let name_low = hw.name.to_ascii_lowercase();
+    let safe_low = hw.safe_name.to_ascii_lowercase();
+    // 1. Check explicit hardware_map.json (exact match first, then substring match)
+    for (k, entry) in hw_map {
+        if (k == &name_low || k == &safe_low) && Path::new(&entry.path).exists() {
+            return (entry.path.clone(), entry.has_process, false);
+        }
+    }
+    for (k, entry) in hw_map {
+        if !k.is_empty()
+            && (name_low.contains(k.as_str()) || safe_low.contains(k.as_str()))
+            && Path::new(&entry.path).exists()
+        {
+            return (entry.path.clone(), entry.has_process, false);
+        }
+    }
+    // 2. Check self-growing TopSolid_Lib_Bazis library
+    let lib_file = hw_lib_dir.join(format!("{}.top", hw.safe_name));
+    let lib_str = lib_file.to_string_lossy().to_string();
+    let needs_gen = !lib_file.exists();
+    (lib_str, false, needs_gen)
+}
+
+/// Auto-generate a lightweight native TopSolid .top hardware component in `TopSolid_Lib_Bazis`
+/// 100% via COM (Origin CS + 3D Parasolid body + BOM Designation/Reference/Supplier, zero UI clicks).
+fn generate_hardware_component(
+    docs: &ComObj,
+    hw: &HardwareItem,
+    dst_path: &str,
+) -> Result<(), String> {
+    let hdoc = docs.call_obj("Add", &[ComArg::Str("top")])?;
+    let csystems = hdoc.get_obj("CoordinateSystems")?;
+    let shapes = hdoc.get_obj("Shapes")?;
+
+    // Standard Origin CS at (0,0,0) so AddWithPositioningByCoordinateSystems(..., "Origin", cs) works
+    let origin_cs = csystems.call_obj(
+        "AddBasic",
+        &[
+            ComArg::F64(0.0),
+            ComArg::F64(0.0),
+            ComArg::F64(0.0),
+            ComArg::F64(1.0),
+            ComArg::F64(0.0),
+            ComArg::F64(0.0),
+            ComArg::F64(0.0),
+            ComArg::F64(1.0),
+            ComArg::F64(0.0),
+        ],
+    )?;
+    let _ = origin_cs.put("Name", ComArg::Str("Origin"));
+
+    let lx = hw.lx.clamp(0.004, 2.0);
+    let ly = hw.ly.clamp(0.004, 2.0);
+    let lz = hw.lz.clamp(0.004, 2.0);
+    let cx = hw.center_local.x;
+    let cy = hw.center_local.y;
+    let cz = hw.center_local.z;
+
+    let body_res = if hw.shape_kind == "cylinder" {
+        // Align cylinder along its longest local dimension
+        let (sx, sy, sz, dx, dy, dz, rad, len) = if lz >= lx && lz >= ly {
+            (cx, cy, cz - lz * 0.5, 0.0, 0.0, 1.0, (lx.min(ly) * 0.5).max(0.002), lz)
+        } else if lx >= ly && lx >= lz {
+            (cx - lx * 0.5, cy, cz, 1.0, 0.0, 0.0, (ly.min(lz) * 0.5).max(0.002), lx)
+        } else {
+            (cx, cy - ly * 0.5, cz, 0.0, 1.0, 0.0, (lx.min(lz) * 0.5).max(0.002), ly)
+        };
+        shapes.call_obj(
+            "AddBasicCylinder",
+            &[
+                ComArg::F64(sx),
+                ComArg::F64(sy),
+                ComArg::F64(sz),
+                ComArg::F64(dx),
+                ComArg::F64(dy),
+                ComArg::F64(dz),
+                ComArg::F64(rad),
+                ComArg::F64(len),
+            ],
+        )
+    } else {
+        shapes.call_obj(
+            "AddBasicBlock",
+            &[
+                ComArg::F64(cx),
+                ComArg::F64(cy),
+                ComArg::F64(cz),
+                ComArg::F64(1.0),
+                ComArg::F64(0.0),
+                ComArg::F64(0.0),
+                ComArg::F64(0.0),
+                ComArg::F64(1.0),
+                ComArg::F64(0.0),
+                ComArg::F64(lx),
+                ComArg::F64(ly),
+                ComArg::F64(lz),
+            ],
+        )
+    };
+
+    if let Ok(body) = body_res {
+        let _ = body.put("Name", ComArg::Str("Body"));
+        let _ = body.put("Designation", ComArg::Str(&hw.name));
+        if !hw.article.is_empty() {
+            let _ = body.put("Reference", ComArg::Str(&hw.article));
+        }
+        if !hw.supplier.is_empty() {
+            let _ = body.put("Supplier", ComArg::Str(&hw.supplier));
+        }
+        let _ = body.put("Layer", ComArg::I32(0));
+        let _ = body.call(
+            "SetTextProperty",
+            &[ComArg::Str("Bazis_Hardware"), ComArg::Str(&hw.name)],
+        );
+        if !hw.supplier.is_empty() {
+            let _ = body.call(
+                "SetTextProperty",
+                &[ComArg::Str("Bazis_Supplier"), ComArg::Str(&hw.supplier)],
+            );
+        }
+    }
+
+    let doc_file = hdoc.get_obj("Document")?;
+    let _ = doc_file.put("Designation", ComArg::Str(&hw.name));
+    if !hw.article.is_empty() {
+        let _ = doc_file.put("Reference", ComArg::Str(&hw.article));
+    }
+    if Path::new(dst_path).exists() {
+        let _ = fs::remove_file(dst_path);
+    }
+    let _ = doc_file.call("SaveAs", &[ComArg::Str(dst_path)])?;
+    let _ = doc_file.call("Close", &[ComArg::Bool(false), ComArg::Bool(false)]);
+    Ok(())
+}
+
 pub fn run_export<F>(
     model: &BazisExportModel,
     mode: ExportMode,
     auto_save: bool,
+    include_hardware: bool,
     cancel: &AtomicBool,
     mut on_progress: F,
 ) -> Result<ExportStats, String>
@@ -535,10 +743,37 @@ where
         }
     }
 
+    // Resolve hardware library & plan missing auto-generated hardware .top components
+    let hw_lib_dir = resolve_hardware_lib_dir(&model.hardware_lib_dir, &tpl_dir);
+    let hw_map = if include_hardware {
+        load_hardware_map(&tpl_dir)
+    } else {
+        Vec::new()
+    };
+    let mut hw_resolved: Vec<(String, bool)> = Vec::new();
+    let mut hw_to_gen: Vec<(usize, String)> = Vec::new();
+    if include_hardware && !model.hardware.is_empty() {
+        let mut gen_seen: HashMap<String, bool> = HashMap::new();
+        for (idx, hw) in model.hardware.iter().enumerate() {
+            let (path, has_proc, needs_gen) = resolve_hardware_component(hw, &hw_map, &hw_lib_dir);
+            if needs_gen && !gen_seen.contains_key(&path) {
+                gen_seen.insert(path.clone(), true);
+                hw_to_gen.push((idx, path.clone()));
+            }
+            hw_resolved.push((path, has_proc));
+        }
+    }
+
     let total_ops = model.total_cuts() + total_hole_ops;
+    let hw_units = if include_hardware {
+        hw_to_gen.len() + model.hardware.len()
+    } else {
+        0
+    };
     let total_units = variants.len()
         + model.panels.len()
         + total_ops
+        + hw_units
         + if mode == ExportMode::NativeTemplates {
             total_ops
         } else {
@@ -555,6 +790,8 @@ where
         holes: 0,
         variants_built: 0,
         native_applied: 0,
+        hardware_generated: 0,
+        hardware_placed: 0,
         errors: 0,
         saved_path: None,
     };
@@ -595,6 +832,28 @@ where
             let _ = cur_doc.call("Save", &[])?;
             let _ = cur_doc.call("Close", &[ComArg::Bool(false), ComArg::Bool(false)]);
             stats.variants_built += 1;
+            progress += 1;
+        }
+    }
+
+    // Phase 1b: Auto-generate missing hardware .top components into TopSolid_Lib_Bazis (100% COM)
+    if include_hardware && !hw_to_gen.is_empty() {
+        fs::create_dir_all(&hw_lib_dir)
+            .map_err(|e| format!("Failed to create hardware library dir {:?}: {}", hw_lib_dir, e))?;
+        for (hw_idx, dst_path) in &hw_to_gen {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped by user during hardware library generation.".into());
+            }
+            let hw = &model.hardware[*hw_idx];
+            on_progress(
+                progress,
+                total_units,
+                &format!("Generating hardware library component: {}.top", hw.safe_name),
+            );
+            match generate_hardware_component(&docs, hw, dst_path) {
+                Ok(()) => stats.hardware_generated += 1,
+                Err(_) => stats.errors += 1,
+            }
             progress += 1;
         }
     }
@@ -1001,6 +1260,78 @@ where
             }
         }
 
+    }
+
+    // Phase 2b: Insert hardware components from hardware_map.json / TopSolid_Lib_Bazis
+    if include_hardware && !model.hardware.is_empty() {
+        for (h_idx, hw) in model.hardware.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(format!(
+                    "Stopped by user at hardware {}/{}.",
+                    h_idx,
+                    model.hardware.len()
+                ));
+            }
+            let (comp_path, has_proc) = &hw_resolved[h_idx];
+            if !Path::new(comp_path).exists() {
+                stats.errors += 1;
+                progress += 1;
+                continue;
+            }
+            let hw_name = format!("Hw{}", h_idx + 1);
+            on_progress(
+                progress,
+                total_units,
+                &format!("Hardware {}/{}: {}", h_idx + 1, model.hardware.len(), hw.name),
+            );
+            let cs_res = csystems.call_obj(
+                "AddBasic",
+                &[
+                    ComArg::F64(hw.origin.x),
+                    ComArg::F64(hw.origin.y),
+                    ComArg::F64(hw.origin.z),
+                    ComArg::F64(hw.ax_x.x),
+                    ComArg::F64(hw.ax_x.y),
+                    ComArg::F64(hw.ax_x.z),
+                    ComArg::F64(hw.ax_y.x),
+                    ComArg::F64(hw.ax_y.y),
+                    ComArg::F64(hw.ax_y.z),
+                ],
+            );
+            if let Ok(cs) = cs_res {
+                if let Ok(cmp) = components.call_obj(
+                    "AddWithPositioningByCoordinateSystems",
+                    &[
+                        ComArg::Str(comp_path),
+                        ComArg::Str("Origin"),
+                        ComArg::Obj(&cs),
+                    ],
+                ) {
+                    if let Ok(el) = cmp.get_obj("Element") {
+                        let _ = el.put("Name", ComArg::Str(&hw_name));
+                        let _ = el.put("Designation", ComArg::Str(&hw.name));
+                        if !hw.article.is_empty() {
+                            let _ = el.put("Reference", ComArg::Str(&hw.article));
+                        }
+                        if !hw.supplier.is_empty() {
+                            let _ = el.put("Supplier", ComArg::Str(&hw.supplier));
+                        }
+                        let _ = el.put("Layer", ComArg::I32(0));
+                    }
+                    stats.hardware_placed += 1;
+                    if *has_proc && mode == ExportMode::NativeTemplates {
+                        for p_name in &hw.connected_panels {
+                            apply_pairs.push((hw_name.clone(), p_name.clone()));
+                        }
+                    }
+                } else {
+                    stats.errors += 1;
+                }
+            } else {
+                stats.errors += 1;
+            }
+            progress += 1;
+        }
     }
 
     // Phase 3: Batch-apply Assembly -> Use process so every panel gets 100% native TopSolid'Wood operations

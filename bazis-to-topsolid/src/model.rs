@@ -90,13 +90,51 @@ pub struct PanelData {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HardwareItem {
+    pub name: String,
+    pub safe_name: String,
+    #[serde(default)]
+    pub article: String,
+    #[serde(default)]
+    pub supplier: String,
+    #[serde(default)]
+    pub shape_kind: String, // "box" | "cylinder"
+    pub origin: Vec3,
+    pub ax_x: Vec3,
+    pub ax_y: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub center_local: Vec3,
+    #[serde(default = "default_hw_dim")]
+    pub lx: f64,
+    #[serde(default = "default_hw_dim")]
+    pub ly: f64,
+    #[serde(default = "default_hw_dim")]
+    pub lz: f64,
+    #[serde(default)]
+    pub connected_panels: Vec<String>,
+}
+
+fn default_vec3_zero() -> Vec3 {
+    Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+}
+
+fn default_hw_dim() -> f64 {
+    0.02
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BazisExportModel {
     pub model_name: String,
     #[serde(default)]
     pub templates_dir: String,
     #[serde(default)]
+    pub hardware_lib_dir: String,
+    #[serde(default)]
     pub save_top_path: String,
     pub panels: Vec<PanelData>,
+    #[serde(default)]
+    pub hardware: Vec<HardwareItem>,
 }
 
 impl BazisExportModel {

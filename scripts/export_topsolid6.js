@@ -275,6 +275,184 @@ function resolveTemplatesDir() {
     return candidates[0];
 }
 
+function resolveHardwareLibDir() {
+    try {
+        var rel = path.resolve(__dirname, "..", "TopSolid_Lib_Bazis");
+        if (fs.existsSync(path.resolve(__dirname, ".."))) return rel;
+    } catch (e) {}
+    return "Y:\\Works\\bazis\\TopSolid_Lib_Bazis";
+}
+
+function cleanHardwareName(raw) {
+    var s = String(raw || "Hardware").split("\r")[0].split("\n")[0].trim();
+    // Strip common extensions if present
+    s = s.replace(/\.(f3d|fr3d|b3d)$/i, "").trim();
+    return s || "Hardware";
+}
+
+function safeHardwareFileName(name) {
+    // Keep ASCII letters, digits, _, -, & (e.g. B&S_Hinge_Blum_71B3550_110_Overlay)
+    var s = String(name || "Hardware")
+        .replace(/[^\x20-\x7E]/g, "_")
+        .replace(/[^A-Za-z0-9_&-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_|_$/g, "");
+    if (!s || /^[0-9]/.test(s)) s = "HW_" + s;
+    return s.slice(0, 64);
+}
+
+function inferSupplier(name) {
+    var low = String(name || "").toLowerCase();
+    if (low.indexOf("blum") >= 0 || low.indexOf("71b") >= 0 || low.indexOf("760h") >= 0 ||
+        low.indexOf("movento") >= 0 || low.indexOf("tandem") >= 0 || low.indexOf("legrabox") >= 0) {
+        return "Blum";
+    }
+    if (low.indexOf("riex") >= 0) return "RIEX";
+    if (low.indexOf("libra") >= 0 || low.indexOf("italiana") >= 0) return "Italiana Ferramenta";
+    return "Bazis";
+}
+
+function inferHardwareShape(name) {
+    var low = String(name || "").toLowerCase();
+    if (low.indexOf("pin") >= 0 || low.indexOf("dowel") >= 0 || low.indexOf("screw") >= 0 ||
+        low.indexOf("shelfholder") >= 0 || low.indexOf("leg") >= 0 || low.indexOf("minifix") >= 0) {
+        return "cylinder";
+    }
+    return "box";
+}
+
+function subtreeHasPanel(obj) {
+    if (!obj) return false;
+    if (obj.AsPanel) return true;
+    var cnt = 0;
+    try { cnt = obj.Count || 0; } catch (e) { cnt = 0; }
+    for (var i = 0; i < cnt; i++) {
+        if (subtreeHasPanel(obj.Objects[i])) return true;
+    }
+    return false;
+}
+
+function extractHardwareTransformAndBox(obj) {
+    var p0 = obj.ToGlobal(NewVector(0, 0, 0));
+    var px = vSub(obj.ToGlobal(NewVector(1, 0, 0)), p0);
+    var py = vSub(obj.ToGlobal(NewVector(0, 1, 0)), p0);
+    var pz = vSub(obj.ToGlobal(NewVector(0, 0, 1)), p0);
+
+    var axX = toTsDir(px);
+    var axY = toTsDir(py);
+    var axZ = toTsDir(pz);
+    // Guarantee right-handed orthonormal frame in TopSolid
+    if (vDot(vCross(axX, axY), axZ) < 0) {
+        axY = { x: -axY.x, y: -axY.y, z: -axY.z };
+    }
+    axY = vNorm(vCross(axZ, axX));
+    var origin = toTsPt(p0);
+
+    // Estimate local 3D bounding box in TopSolid local frame (meters)
+    var lx = 0.02, ly = 0.02, lz = 0.02;
+    var centerLocal = { x: 0, y: 0, z: 0 };
+    try {
+        var gMin = obj.GMin;
+        var gMax = obj.GMax;
+        if (gMin && gMax) {
+            var gx = [gMin.x, gMax.x], gy = [gMin.y, gMax.y], gz = [gMin.z, gMax.z];
+            var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, minZ = 1e9, maxZ = -1e9;
+            var valid = false;
+            for (var ix = 0; ix < 2; ix++) {
+                for (var iy = 0; iy < 2; iy++) {
+                    for (var iz = 0; iz < 2; iz++) {
+                        var ptTs = toTsPt(NewVector(gx[ix], gy[iy], gz[iz]));
+                        var rel = vSub(ptTs, origin);
+                        var lx0 = vDot(rel, axX);
+                        var ly0 = vDot(rel, axY);
+                        var lz0 = vDot(rel, axZ);
+                        if (lx0 < minX) minX = lx0;
+                        if (lx0 > maxX) maxX = lx0;
+                        if (ly0 < minY) minY = ly0;
+                        if (ly0 > maxY) maxY = ly0;
+                        if (lz0 < minZ) minZ = lz0;
+                        if (lz0 > maxZ) maxZ = lz0;
+                        valid = true;
+                    }
+                }
+            }
+            if (valid && (maxX - minX > 0.001 || maxY - minY > 0.001 || maxZ - minZ > 0.001)) {
+                lx = Math.max(0.004, Math.min(2.0, maxX - minX));
+                ly = Math.max(0.004, Math.min(2.0, maxY - minY));
+                lz = Math.max(0.004, Math.min(2.0, maxZ - minZ));
+                centerLocal = {
+                    x: (minX + maxX) / 2,
+                    y: (minY + maxY) / 2,
+                    z: (minZ + maxZ) / 2
+                };
+            }
+        }
+    } catch (e) {}
+
+    return {
+        origin: origin,
+        axX: axX,
+        axY: axY,
+        centerLocal: centerLocal,
+        lx: lx,
+        ly: ly,
+        lz: lz
+    };
+}
+
+function collectHardware(container, panelUidToTsName, out) {
+    var cnt = 0;
+    try { cnt = container.Count || 0; } catch (e) { cnt = 0; }
+    for (var i = 0; i < cnt; i++) {
+        var obj = container.Objects[i];
+        if (!obj || obj.Visible === false) continue;
+        if (obj.AsPanel) continue;
+
+        var isFastener = false;
+        try { isFastener = !!(obj.Holes && obj.Holes.Count >= 0); } catch (e) { isFastener = false; }
+
+        var childCount = 0;
+        try { childCount = obj.Count || 0; } catch (e) { childCount = 0; }
+
+        // Case 1: TFastener (hinge, dowel, screw, shelfholder, cam lock, etc.)
+        // Case 2: Non-panel hardware block/fragment (legs, hangers, handles — subtree has 0 panels)
+        if (isFastener || (childCount > 0 && !subtreeHasPanel(obj))) {
+            var rawName = "";
+            try { rawName = obj.Name || ""; } catch (e) {}
+            var name = cleanHardwareName(rawName);
+            if (!name || name === "Model") continue;
+
+            var art = "";
+            try { art = String(obj.ArtPos || "").trim(); } catch (e) {}
+            var tf = extractHardwareTransformAndBox(obj);
+
+            // Skip degenerate 0-size empty containers
+            if (!isFastener && tf.lx <= 0.005 && tf.ly <= 0.005 && tf.lz <= 0.005) continue;
+
+            out.push({
+                name: name,
+                safeName: safeHardwareFileName(name),
+                article: art,
+                supplier: inferSupplier(name),
+                shapeKind: inferHardwareShape(name),
+                origin: tf.origin,
+                axX: tf.axX,
+                axY: tf.axY,
+                centerLocal: tf.centerLocal,
+                lx: tf.lx,
+                ly: tf.ly,
+                lz: tf.lz,
+                connectedPanels: []
+            });
+            continue;
+        }
+
+        if (childCount > 0) {
+            collectHardware(obj, panelUidToTsName, out);
+        }
+    }
+}
+
 function findTemplates(dir) {
     var map = {
         drill: path.join(dir, "B&S_Drill.top"),
@@ -736,14 +914,20 @@ function main() {
     }
 
     var tplDir = resolveTemplatesDir();
+    var hwLibDir = resolveHardwareLibDir();
     var panels = [];
+    var panelUidToTsName = {};
     var totalCuts = 0, totalHoles = 0;
     for (var i = 0; i < rawPanels.length; i++) {
         var pd = extractPanelData(rawPanels[i], i + 1);
         panels.push(pd);
+        try { panelUidToTsName[rawPanels[i].UID] = "P" + (i + 1); } catch (e) {}
         totalCuts += pd.cuts.length;
         totalHoles += pd.holes.length;
     }
+
+    var hardware = [];
+    collectHardware(Model, panelUidToTsName, hardware);
 
     var modelName = (Article && Article.Name) ? String(Article.Name) : "BazisModel";
     var safeModel = modelName.replace(/[^A-Za-z0-9_\-]/g, "_") || "BazisModel";
@@ -756,8 +940,10 @@ function main() {
         var payload = {
             modelName: modelName,
             templatesDir: tplDir,
+            hardwareLibDir: hwLibDir,
             saveTopPath: saveTopPath,
-            panels: panels
+            panels: panels,
+            hardware: hardware
         };
         fs.writeFileSync(jsonPath, JSON.stringify(payload), "utf8");
         var child = cp.spawn(rustExe, [jsonPath], {
