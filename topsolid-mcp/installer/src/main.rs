@@ -46,11 +46,15 @@ mod win_setup {
         LR_LOADFROMFILE, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MSG, SM_CXSCREEN, SM_CYSCREEN,
         SW_SHOW, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_SETICON, WNDCLASSW,
         WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_SYSMENU, WS_TABSTOP,
-        WS_VISIBLE,
+        WS_VISIBLE, WS_VSCROLL,
     };
     const SS_LEFT: u32 = 0;
+    const CBS_DROPDOWN: u32 = 0x0002;
+    const CBS_AUTOHSCROLL: u32 = 0x0040;
+    const CB_ADDSTRING: u32 = 0x0143;
+    const CB_SETCURSEL: u32 = 0x014E;
 
-    const APP_VERSION: &str = "0.2.1";
+    const APP_VERSION: &str = "0.2.2";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Embedded payload files from topsolid-mcp/
@@ -62,6 +66,7 @@ mod win_setup {
         ("agent/ts6_tray_launcher.vbs", include_bytes!("../../agent/ts6_tray_launcher.vbs")),
         ("agent/ts6_apply_ops.ps1", include_bytes!("../../agent/ts6_apply_ops.ps1")),
         ("agent/ts6_ensure_deps.ps1", include_bytes!("../../agent/ts6_ensure_deps.ps1")),
+        ("agent/ts6_build_templates.ps1", include_bytes!("../../agent/ts6_build_templates.ps1")),
         ("server/index.mjs", include_bytes!("../../server/index.mjs")),
         ("Start_TopSolid6_Bridge.bat", include_bytes!("../../Start_TopSolid6_Bridge.bat")),
         ("Install_TopSolid6_MCP.bat", include_bytes!("../../Install_TopSolid6_MCP.bat")),
@@ -78,6 +83,9 @@ mod win_setup {
     const ID_CHK_LAUNCH: usize = 108;
     const ID_BTN_INSTALL: usize = 109;
     const ID_BTN_CANCEL: usize = 110;
+    const ID_CMB_TOPSOLID: usize = 111;
+    const ID_CHK_TEMPLATES: usize = 112;
+    const ID_BTN_REBUILD_TPL: usize = 113;
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
     const WM_APP_DONE: u32 = WM_APP + 2;
@@ -87,8 +95,10 @@ mod win_setup {
         install_dir: PathBuf,
         ipc_dir: PathBuf,
         templates_dir: PathBuf,
+        topsolid_exe: String,
         ensure_node: bool,
         configure_antigravity: bool,
+        build_templates: bool,
         install_service: bool,
         install_start_menu: bool,
         launch_after: bool,
@@ -98,17 +108,53 @@ mod win_setup {
         hwnd_install: HWND,
         hwnd_ipc: HWND,
         hwnd_templates: HWND,
+        hwnd_cmb_ts: HWND,
         hwnd_chk_node: HWND,
         hwnd_chk_agy: HWND,
+        hwnd_chk_tpl: HWND,
         hwnd_chk_svc: HWND,
         hwnd_chk_sm: HWND,
         hwnd_chk_launch: HWND,
+        hwnd_btn_rebuild: HWND,
         hwnd_btn_install: HWND,
         hwnd_btn_cancel: HWND,
         hwnd_progress: HWND,
         hwnd_status: HWND,
         installing: Arc<AtomicBool>,
         finished: bool,
+    }
+
+    fn discover_topsolid_exes() -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        let roots = [
+            r"C:\Missler",
+            r"D:\Missler",
+            r"E:\Missler",
+            r"C:\Program Files\Missler",
+            r"C:\Program Files (x86)\Missler",
+        ];
+        for root in roots {
+            let Ok(rd) = fs::read_dir(root) else { continue };
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.to_ascii_uppercase().starts_with("V6") {
+                    continue;
+                }
+                let bin_dir = entry.path().join("bin");
+                let Ok(brd) = fs::read_dir(&bin_dir) else { continue };
+                for be in brd.flatten() {
+                    let bname = be.file_name().to_string_lossy().to_ascii_lowercase();
+                    if bname.starts_with("top6") && bname.ends_with(".exe") {
+                        let p = be.path().to_string_lossy().to_string();
+                        if !found.iter().any(|x| x.eq_ignore_ascii_case(&p)) {
+                            found.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by(|a, b| b.cmp(a));
+        found
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -232,14 +278,16 @@ mod win_setup {
         // 3. Ensure IPC folder & write %APPDATA%\TopSolid6MCP\config.json
         on_progress(42, "Writing configuration...");
         let _ = fs::create_dir_all(&opts.ipc_dir);
+        let _ = fs::create_dir_all(&opts.templates_dir);
         if let Ok(appdata) = std::env::var("APPDATA") {
             let cfg_dir = PathBuf::from(appdata).join("TopSolid6MCP");
             let _ = fs::create_dir_all(&cfg_dir);
             let cfg_path = cfg_dir.join("config.json");
             let cfg_json = format!(
-                "{{\r\n  \"ipcDir\": \"{}\",\r\n  \"templatesDir\": \"{}\",\r\n  \"pollIntervalMs\": 120,\r\n  \"githubRepo\": \"cebdan/bazis-mcp-scripts\",\r\n  \"githubBranch\": \"main\",\r\n  \"autoCheckUpdates\": true,\r\n  \"showNotifications\": true\r\n}}\r\n",
+                "{{\r\n  \"ipcDir\": \"{}\",\r\n  \"templatesDir\": \"{}\",\r\n  \"topsolidExe\": \"{}\",\r\n  \"pollIntervalMs\": 120,\r\n  \"githubRepo\": \"cebdan/bazis-mcp-scripts\",\r\n  \"githubBranch\": \"main\",\r\n  \"autoCheckUpdates\": true,\r\n  \"showNotifications\": true\r\n}}\r\n",
                 json_escape(&opts.ipc_dir.to_string_lossy()),
-                json_escape(&opts.templates_dir.to_string_lossy())
+                json_escape(&opts.templates_dir.to_string_lossy()),
+                json_escape(&opts.topsolid_exe)
             );
             fs::write(&cfg_path, cfg_json)
                 .map_err(|e| format!("Failed to write config.json: {e}"))?;
@@ -299,6 +347,38 @@ mod win_setup {
                 }
             }
             on_progress(72, &format!("Node.js ready: {node_summary}"));
+        }
+
+        // 4b. Build base B&S_*.top templates natively if Templates folder is missing them
+        let mut tpl_summary = "Already present / Skipped".to_string();
+        if opts.build_templates && !opts.templates_dir.join("B&S_Drill.top").exists() {
+            on_progress(75, "Building base B&S_*.top templates in chosen TopSolid version...");
+            let tpl_ps1 = opts.install_dir.join("agent").join("ts6_build_templates.ps1");
+            let mut t_args: Vec<String> = vec![
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                tpl_ps1.to_string_lossy().into_owned(),
+                "-TemplatesDir".into(),
+                opts.templates_dir.to_string_lossy().into_owned(),
+            ];
+            if !opts.topsolid_exe.is_empty() {
+                t_args.push("-TopSolidExe".into());
+                t_args.push(opts.topsolid_exe.clone());
+            }
+            if let Ok(out) = Command::new("powershell.exe")
+                .args(&t_args)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+            {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains("TEMPLATES_OK|") {
+                    tpl_summary = format!("Built in {}", opts.templates_dir.display());
+                } else {
+                    tpl_summary = "Skipped (start TopSolid and click Rebuild Templates)".to_string();
+                }
+            }
         }
 
         // 5. Install Windows autostart service (Scheduled Task)
@@ -392,6 +472,7 @@ mod win_setup {
             "TopSolid MCP Bridge v{APP_VERSION} installed successfully!\r\n\r\n\
              - Node.js runtime: {node_summary}\r\n\
              - Antigravity MCP: {mcp_summary}\r\n\
+             - Base Templates: {tpl_summary}\r\n\
              - MCP self-test: {verify_summary}\r\n\
              - System Tray icon: left-click for Info, right-click for Settings\r\n\
              - Start Menu: 'TopSolid MCP'\r\n\r\n\
@@ -419,6 +500,45 @@ mod win_setup {
                     }
                     return 0;
                 }
+                if id == ID_BTN_REBUILD_TPL {
+                    if st.installing.load(Ordering::Relaxed) {
+                        return 0;
+                    }
+                    let install_dir = PathBuf::from(get_text(st.hwnd_install));
+                    let tpl_dir = PathBuf::from(get_text(st.hwnd_templates));
+                    let raw_ts = get_text(st.hwnd_cmb_ts);
+                    let ts_exe = if raw_ts.starts_with("Auto") { String::new() } else { raw_ts };
+                    let mut builder = install_dir.join("agent").join("ts6_build_templates.ps1");
+                    if !builder.exists() {
+                        let tmp_ps1 = std::env::temp_dir().join("ts6_build_templates.ps1");
+                        let _ = fs::write(&tmp_ps1, include_bytes!("../../agent/ts6_build_templates.ps1"));
+                        builder = tmp_ps1;
+                    }
+                    let mut args_vec: Vec<String> = vec![
+                        "/C".into(),
+                        "start".into(),
+                        "".into(),
+                        "powershell.exe".into(),
+                        "-NoProfile".into(),
+                        "-ExecutionPolicy".into(),
+                        "Bypass".into(),
+                        "-File".into(),
+                        builder.to_string_lossy().into_owned(),
+                        "-TemplatesDir".into(),
+                        tpl_dir.to_string_lossy().into_owned(),
+                        "-Force".into(),
+                        "-PauseOnExit".into(),
+                    ];
+                    if !ts_exe.is_empty() {
+                        args_vec.push("-TopSolidExe".into());
+                        args_vec.push(ts_exe);
+                    }
+                    let _ = Command::new("cmd.exe")
+                        .args(&args_vec)
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .spawn();
+                    return 0;
+                }
                 if id == ID_BTN_INSTALL {
                     if st.finished {
                         DestroyWindow(hwnd);
@@ -427,12 +547,16 @@ mod win_setup {
                     if st.installing.swap(true, Ordering::SeqCst) {
                         return 0;
                     }
+                    let raw_ts = get_text(st.hwnd_cmb_ts);
+                    let ts_exe = if raw_ts.starts_with("Auto") { String::new() } else { raw_ts };
                     let opts = InstallOptions {
                         install_dir: PathBuf::from(get_text(st.hwnd_install)),
                         ipc_dir: PathBuf::from(get_text(st.hwnd_ipc)),
                         templates_dir: PathBuf::from(get_text(st.hwnd_templates)),
+                        topsolid_exe: ts_exe,
                         ensure_node: is_checked(st.hwnd_chk_node),
                         configure_antigravity: is_checked(st.hwnd_chk_agy),
+                        build_templates: is_checked(st.hwnd_chk_tpl),
                         install_service: is_checked(st.hwnd_chk_svc),
                         install_start_menu: is_checked(st.hwnd_chk_sm),
                         launch_after: is_checked(st.hwnd_chk_launch),
@@ -446,9 +570,11 @@ mod win_setup {
                     }
                     EnableWindow(st.hwnd_btn_install, 0);
                     EnableWindow(st.hwnd_btn_cancel, 0);
+                    EnableWindow(st.hwnd_btn_rebuild, 0);
                     EnableWindow(st.hwnd_install, 0);
                     EnableWindow(st.hwnd_ipc, 0);
                     EnableWindow(st.hwnd_templates, 0);
+                    EnableWindow(st.hwnd_cmb_ts, 0);
 
                     let hwnd_num = hwnd as usize;
                     let flag = st.installing.clone();
@@ -507,9 +633,11 @@ mod win_setup {
                     let st = &mut *ptr;
                     EnableWindow(st.hwnd_btn_install, 1);
                     EnableWindow(st.hwnd_btn_cancel, 1);
+                    EnableWindow(st.hwnd_btn_rebuild, 1);
                     EnableWindow(st.hwnd_install, 1);
                     EnableWindow(st.hwnd_ipc, 1);
                     EnableWindow(st.hwnd_templates, 1);
+                    EnableWindow(st.hwnd_cmb_ts, 1);
                     let err_msg = if lparam != 0 {
                         *Box::from_raw(lparam as *mut String)
                     } else {
@@ -549,14 +677,18 @@ mod win_setup {
             .any(|a| a.eq_ignore_ascii_case("/S") || a.eq_ignore_ascii_case("--silent"));
 
         let (def_install, def_ipc, def_tpl) = default_paths();
+        let discovered_ts = discover_topsolid_exes();
+        let default_ts_exe = discovered_ts.first().cloned().unwrap_or_default();
 
         if silent {
             let opts = InstallOptions {
                 install_dir: def_install,
                 ipc_dir: def_ipc,
                 templates_dir: def_tpl,
+                topsolid_exe: default_ts_exe,
                 ensure_node: true,
                 configure_antigravity: true,
+                build_templates: true,
                 install_service: true,
                 install_start_menu: true,
                 launch_after: true,
@@ -602,8 +734,8 @@ mod win_setup {
             };
             RegisterClassW(&wc);
 
-            let win_w = s(590);
-            let win_h = s(500);
+            let win_w = s(600);
+            let win_h = s(565);
             let scr_w = GetSystemMetrics(SM_CXSCREEN);
             let scr_h = GetSystemMetrics(SM_CYSCREEN);
             let win_x = ((scr_w - win_w) / 2).max(0);
@@ -683,36 +815,52 @@ mod win_setup {
             let hwnd_ipc = mk("EDIT", &def_ipc.to_string_lossy(), WS_BORDER | WS_TABSTOP | (ES_AUTOHSCROLL as u32), 134, 127, 416, 26, ID_EDIT_IPC, font_norm);
 
             mk("STATIC", "Templates Dir:", SS_LEFT, 20, 164, 110, 22, 0, font_norm);
-            let hwnd_templates = mk("EDIT", &def_tpl.to_string_lossy(), WS_BORDER | WS_TABSTOP | (ES_AUTOHSCROLL as u32), 134, 161, 416, 26, ID_EDIT_TEMPLATES, font_norm);
+            let hwnd_templates = mk("EDIT", &def_tpl.to_string_lossy(), WS_BORDER | WS_TABSTOP | (ES_AUTOHSCROLL as u32), 134, 161, 426, 26, ID_EDIT_TEMPLATES, font_norm);
 
-            let hwnd_chk_node = mk("BUTTON", "Check & auto-install Node.js LTS runtime if missing (required for MCP)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 200, 540, 24, ID_CHK_NODE, font_norm);
-            let hwnd_chk_agy = mk("BUTTON", "Auto-configure Antigravity MCP (mcp_config.json)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 228, 540, 24, ID_CHK_AGY, font_norm);
-            let hwnd_chk_svc = mk("BUTTON", "Install as Windows Service (Autostart at logon via Task Scheduler)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 256, 540, 24, ID_CHK_SERVICE, font_norm);
-            let hwnd_chk_sm = mk("BUTTON", "Create Start Menu section (\"TopSolid MCP\")", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 284, 540, 24, ID_CHK_STARTMENU, font_norm);
-            let hwnd_chk_launch = mk("BUTTON", "Launch TopSolid MCP Bridge in System Tray & run MCP self-test", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 312, 540, 24, ID_CHK_LAUNCH, font_norm);
+            mk("STATIC", "TopSolid Ver:", SS_LEFT, 20, 198, 110, 22, 0, font_norm);
+            let hwnd_cmb_ts = mk("COMBOBOX", "", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP, 134, 195, 426, 180, ID_CMB_TOPSOLID, font_norm);
+            let auto_item = to_wide("Auto (Active COM / Newest)");
+            SendMessageW(hwnd_cmb_ts, CB_ADDSTRING, 0, auto_item.as_ptr() as LPARAM);
+            for exe_p in &discovered_ts {
+                let wp = to_wide(exe_p);
+                SendMessageW(hwnd_cmb_ts, CB_ADDSTRING, 0, wp.as_ptr() as LPARAM);
+            }
+            SendMessageW(hwnd_cmb_ts, CB_SETCURSEL, if discovered_ts.is_empty() { 0 } else { 1 }, 0);
+
+            let hwnd_chk_node = mk("BUTTON", "Check & auto-install Node.js LTS runtime if missing (required for MCP)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 236, 540, 24, ID_CHK_NODE, font_norm);
+            let hwnd_chk_agy = mk("BUTTON", "Auto-configure Antigravity MCP (mcp_config.json)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 264, 540, 24, ID_CHK_AGY, font_norm);
+            let hwnd_chk_tpl = mk("BUTTON", "Build base B&&S_*.top templates in chosen TopSolid if folder is empty", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 292, 540, 24, ID_CHK_TEMPLATES, font_norm);
+            let hwnd_chk_svc = mk("BUTTON", "Install as Windows Service (Autostart at logon via Task Scheduler)", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 320, 540, 24, ID_CHK_SERVICE, font_norm);
+            let hwnd_chk_sm = mk("BUTTON", "Create Start Menu section (\"TopSolid MCP\")", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 348, 540, 24, ID_CHK_STARTMENU, font_norm);
+            let hwnd_chk_launch = mk("BUTTON", "Launch TopSolid MCP Bridge in System Tray & run MCP self-test", (BS_AUTOCHECKBOX as u32) | WS_TABSTOP, 20, 376, 540, 24, ID_CHK_LAUNCH, font_norm);
             SendMessageW(hwnd_chk_node, BM_SETCHECK, 1, 0);
             SendMessageW(hwnd_chk_agy, BM_SETCHECK, 1, 0);
+            SendMessageW(hwnd_chk_tpl, BM_SETCHECK, 1, 0);
             SendMessageW(hwnd_chk_svc, BM_SETCHECK, 1, 0);
             SendMessageW(hwnd_chk_sm, BM_SETCHECK, 1, 0);
             SendMessageW(hwnd_chk_launch, BM_SETCHECK, 1, 0);
 
-            let hwnd_progress = mk("msctls_progress32", "", 0, 20, 352, 540, 22, 0, font_norm);
+            let hwnd_progress = mk("msctls_progress32", "", 0, 20, 414, 540, 22, 0, font_norm);
             SendMessageW(hwnd_progress, PBM_SETRANGE32, 0, 100);
 
-            let hwnd_status = mk("STATIC", "Ready to install.", SS_LEFT, 20, 382, 540, 22, 0, font_norm);
+            let hwnd_status = mk("STATIC", "Ready to install.", SS_LEFT, 20, 444, 540, 22, 0, font_norm);
 
-            let hwnd_btn_install = mk("BUTTON", "Install", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP, 344, 416, 106, 32, ID_BTN_INSTALL, font_norm);
-            let hwnd_btn_cancel = mk("BUTTON", "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP, 458, 416, 102, 32, ID_BTN_CANCEL, font_norm);
+            let hwnd_btn_rebuild = mk("BUTTON", "Rebuild Templates...", (BS_PUSHBUTTON as u32) | WS_TABSTOP, 20, 478, 175, 32, ID_BTN_REBUILD_TPL, font_norm);
+            let hwnd_btn_install = mk("BUTTON", "Install", (BS_DEFPUSHBUTTON as u32) | WS_TABSTOP, 344, 478, 106, 32, ID_BTN_INSTALL, font_norm);
+            let hwnd_btn_cancel = mk("BUTTON", "Cancel", (BS_PUSHBUTTON as u32) | WS_TABSTOP, 458, 478, 102, 32, ID_BTN_CANCEL, font_norm);
 
             let st = Box::new(UiState {
                 hwnd_install,
                 hwnd_ipc,
                 hwnd_templates,
+                hwnd_cmb_ts,
                 hwnd_chk_node,
                 hwnd_chk_agy,
+                hwnd_chk_tpl,
                 hwnd_chk_svc,
                 hwnd_chk_sm,
                 hwnd_chk_launch,
+                hwnd_btn_rebuild,
                 hwnd_btn_install,
                 hwnd_btn_cancel,
                 hwnd_progress,

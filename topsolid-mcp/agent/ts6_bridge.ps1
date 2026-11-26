@@ -80,6 +80,7 @@ function Load-BridgeConfig {
     $cfg = [ordered]@{
         ipcDir            = $script:DefaultIpcDir
         templatesDir      = $script:DefaultTemplatesDir
+        topsolidExe       = ""
         pollIntervalMs    = 120
         githubRepo        = $script:DefaultRepo
         githubBranch      = $script:DefaultBranch
@@ -91,6 +92,7 @@ function Load-BridgeConfig {
             $saved = [System.IO.File]::ReadAllText($script:ConfigPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             if ($saved.ipcDir) { $cfg.ipcDir = [string]$saved.ipcDir }
             if ($saved.templatesDir) { $cfg.templatesDir = [string]$saved.templatesDir }
+            if ($null -ne $saved.topsolidExe) { $cfg.topsolidExe = [string]$saved.topsolidExe }
             if ($null -ne $saved.pollIntervalMs -and [int]$saved.pollIntervalMs -ge 30) { $cfg.pollIntervalMs = [int]$saved.pollIntervalMs }
             if ($saved.githubRepo) { $cfg.githubRepo = [string]$saved.githubRepo }
             if ($saved.githubBranch) { $cfg.githubBranch = [string]$saved.githubBranch }
@@ -100,7 +102,59 @@ function Load-BridgeConfig {
     }
     if ($env:TS6_IPC_DIR) { $cfg.ipcDir = $env:TS6_IPC_DIR }
     if ($env:TS6_TEMPLATES_DIR) { $cfg.templatesDir = $env:TS6_TEMPLATES_DIR }
+    if ($env:TS6_TOPSOLID_EXE) { $cfg.topsolidExe = $env:TS6_TOPSOLID_EXE }
     return $cfg
+}
+
+function Get-InstalledTopSolidVersions {
+    $found = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    $roots = @("C:\Missler", "D:\Missler", "E:\Missler", "C:\Program Files\Missler", "C:\Program Files (x86)\Missler")
+    foreach ($root in $roots) {
+        if (-not (Test-Path $root)) { continue }
+        Get-ChildItem -Path $root -Directory -Filter "V6*" -ErrorAction SilentlyContinue | ForEach-Object {
+            $binDir = Join-Path $_.FullName "bin"
+            if (Test-Path $binDir) {
+                Get-ChildItem -Path $binDir -File -Filter "top6*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
+                    $p = $_.FullName
+                    $k = $p.ToLowerInvariant()
+                    if (-not $seen.ContainsKey($k)) {
+                        $seen[$k] = $true
+                        $ver = if ($p -match 'V6(\d\d)') { "6." + $Matches[1] } elseif ($p -match 'top6(\d\d)\.exe') { "6." + $Matches[1] } else { "6.xx" }
+                        $found.Add([PSCustomObject]@{ version = $ver; exePath = $p; label = "TopSolid $ver ($p)" })
+                    }
+                }
+            }
+        }
+    }
+    return @($found | Sort-Object -Property version -Descending)
+}
+
+function Invoke-RebuildTemplates([string]$tplDir, [string]$tsExe) {
+    $builder = Join-Path $PSScriptRoot "ts6_build_templates.ps1"
+    if (-not (Test-Path $builder)) {
+        [System.Windows.Forms.MessageBox]::Show("Template builder script not found:`n$builder", "Rebuild Templates", "OK", "Error") | Out-Null
+        return
+    }
+    $verDesc = if ($tsExe) { $tsExe } else { "Auto (Active COM / Newest installed)" }
+    $ans = [System.Windows.Forms.MessageBox]::Show(
+        "Rebuild all 6 base B&S_*.top templates now?`n`nTemplates folder:`n$tplDir`n`nTopSolid version:`n$verDesc`n`nNote: Save any open TopSolid projects first.",
+        "Rebuild TopSolid Templates",
+        [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    if ($ans -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $argList = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass",
+        "-File", "`"$builder`"",
+        "-TemplatesDir", "`"$tplDir`"",
+        "-Force", "-PauseOnExit"
+    )
+    if ($tsExe) {
+        $argList += @("-TopSolidExe", "`"$tsExe`"")
+    }
+    Start-Process -FilePath "powershell.exe" -ArgumentList ($argList -join " ")
+    Write-BridgeLog "Launched template rebuild in $tplDir (exe='$tsExe')."
 }
 
 function Save-BridgeConfig($cfg) {
@@ -1260,7 +1314,7 @@ function Show-SettingsWindow {
     $form = New-Object System.Windows.Forms.Form
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
     $form.Text = "TopSolid MCP Bridge - Settings"
-    $form.ClientSize = New-Object System.Drawing.Size((S 560), (S 505))
+    $form.ClientSize = New-Object System.Drawing.Size((S 560), (S 585))
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.StartPosition = "CenterScreen"
@@ -1270,9 +1324,9 @@ function Show-SettingsWindow {
 
     # --- Group 1: Paths & Bridge ---
     $grpBridge = New-Object System.Windows.Forms.GroupBox
-    $grpBridge.Text = "Bridge & Paths"
+    $grpBridge.Text = "Bridge, Paths & TopSolid Version"
     $grpBridge.Location = New-Object System.Drawing.Point((S 14), (S 12))
-    $grpBridge.Size = New-Object System.Drawing.Size((S 532), (S 150))
+    $grpBridge.Size = New-Object System.Drawing.Size((S 532), (S 230))
     $form.Controls.Add($grpBridge)
 
     $lblIpc = New-Object System.Windows.Forms.Label
@@ -1323,9 +1377,54 @@ function Show-SettingsWindow {
     })
     $grpBridge.Controls.Add($btnBrowseTpl)
 
+    $lblTsVer = New-Object System.Windows.Forms.Label
+    $lblTsVer.Text = "TopSolid Ver:"
+    $lblTsVer.Location = New-Object System.Drawing.Point((S 12), (S 102))
+    $lblTsVer.Size = New-Object System.Drawing.Size((S 100), (S 24))
+    $grpBridge.Controls.Add($lblTsVer)
+
+    $cmbTsVer = New-Object System.Windows.Forms.ComboBox
+    $cmbTsVer.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDown
+    $cmbTsVer.Location = New-Object System.Drawing.Point((S 116), (S 99))
+    $cmbTsVer.Size = New-Object System.Drawing.Size((S 314), (S 26))
+    [void]$cmbTsVer.Items.Add("Auto (Active COM / Newest)")
+    $tsList = @(Get-InstalledTopSolidVersions)
+    foreach ($it in $tsList) { [void]$cmbTsVer.Items.Add($it.exePath) }
+    if ($script:Config.topsolidExe) {
+        $idxFound = $cmbTsVer.Items.IndexOf($script:Config.topsolidExe)
+        if ($idxFound -ge 0) { $cmbTsVer.SelectedIndex = $idxFound } else { $cmbTsVer.Text = $script:Config.topsolidExe }
+    } else {
+        $cmbTsVer.SelectedIndex = 0
+    }
+    $grpBridge.Controls.Add($cmbTsVer)
+
+    $btnBrowseTs = New-Object System.Windows.Forms.Button
+    $btnBrowseTs.Text = "Browse..."
+    $btnBrowseTs.Location = New-Object System.Drawing.Point((S 438), (S 97))
+    $btnBrowseTs.Size = New-Object System.Drawing.Size((S 82), (S 28))
+    $btnBrowseTs.Add_Click({
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.Filter = "TopSolid Executable (top6*.exe)|top6*.exe|Executable (*.exe)|*.exe"
+        $ofd.Title = "Select TopSolid'Wood 6.xx Executable"
+        if ($ofd.ShowDialog() -eq "OK") { $script:SettingsUI.cmbTsVer.Text = $ofd.FileName }
+        $ofd.Dispose()
+    })
+    $grpBridge.Controls.Add($btnBrowseTs)
+
+    $btnRebuildTpl = New-Object System.Windows.Forms.Button
+    $btnRebuildTpl.Text = "Rebuild Templates (B&&S_*.top)..."
+    $btnRebuildTpl.Location = New-Object System.Drawing.Point((S 116), (S 136))
+    $btnRebuildTpl.Size = New-Object System.Drawing.Size((S 240), (S 30))
+    $btnRebuildTpl.Add_Click({
+        $selExe = $script:SettingsUI.cmbTsVer.Text.Trim()
+        if ($selExe -like "Auto*") { $selExe = "" }
+        Invoke-RebuildTemplates $script:SettingsUI.txtTpl.Text.Trim() $selExe
+    })
+    $grpBridge.Controls.Add($btnRebuildTpl)
+
     $lblPoll = New-Object System.Windows.Forms.Label
     $lblPoll.Text = "Poll Interval (ms):"
-    $lblPoll.Location = New-Object System.Drawing.Point((S 12), (S 106))
+    $lblPoll.Location = New-Object System.Drawing.Point((S 12), (S 182))
     $lblPoll.Size = New-Object System.Drawing.Size((S 116), (S 24))
     $grpBridge.Controls.Add($lblPoll)
 
@@ -1334,21 +1433,21 @@ function Show-SettingsWindow {
     $numPoll.Maximum = 2000
     $numPoll.Increment = 10
     $numPoll.Value = [Math]::Min(2000, [Math]::Max(30, [int]$script:Config.pollIntervalMs))
-    $numPoll.Location = New-Object System.Drawing.Point((S 132), (S 103))
+    $numPoll.Location = New-Object System.Drawing.Point((S 132), (S 179))
     $numPoll.Size = New-Object System.Drawing.Size((S 84), (S 26))
     $grpBridge.Controls.Add($numPoll)
 
     $chkNotif = New-Object System.Windows.Forms.CheckBox
     $chkNotif.Text = "Show tray balloon notifications"
     $chkNotif.Checked = [bool]$script:Config.showNotifications
-    $chkNotif.Location = New-Object System.Drawing.Point((S 232), (S 105))
+    $chkNotif.Location = New-Object System.Drawing.Point((S 232), (S 181))
     $chkNotif.AutoSize = $true
     $grpBridge.Controls.Add($chkNotif)
 
     # --- Group 2: GitHub Updates ---
     $grpGit = New-Object System.Windows.Forms.GroupBox
     $grpGit.Text = "GitHub Updates"
-    $grpGit.Location = New-Object System.Drawing.Point((S 14), (S 172))
+    $grpGit.Location = New-Object System.Drawing.Point((S 14), (S 252))
     $grpGit.Size = New-Object System.Drawing.Size((S 532), (S 136))
     $form.Controls.Add($grpGit)
 
@@ -1406,7 +1505,7 @@ function Show-SettingsWindow {
     # --- Group 3: Windows Service & Start Menu ---
     $grpWin = New-Object System.Windows.Forms.GroupBox
     $grpWin.Text = "Windows Integration (Service & Start Menu)"
-    $grpWin.Location = New-Object System.Drawing.Point((S 14), (S 318))
+    $grpWin.Location = New-Object System.Drawing.Point((S 14), (S 398))
     $grpWin.Size = New-Object System.Drawing.Size((S 532), (S 126))
     $form.Controls.Add($grpWin)
 
@@ -1484,11 +1583,13 @@ function Show-SettingsWindow {
     # --- Save / Cancel ---
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = "Save & Apply"
-    $btnSave.Location = New-Object System.Drawing.Point((S 326), (S 458))
+    $btnSave.Location = New-Object System.Drawing.Point((S 326), (S 538))
     $btnSave.Size = New-Object System.Drawing.Size((S 112), (S 34))
     $btnSave.Add_Click({
         $script:Config.ipcDir = $script:SettingsUI.txtIpc.Text.Trim()
         $script:Config.templatesDir = $script:SettingsUI.txtTpl.Text.Trim()
+        $selExe = $script:SettingsUI.cmbTsVer.Text.Trim()
+        $script:Config.topsolidExe = if ($selExe -like "Auto*") { "" } else { $selExe }
         $script:Config.pollIntervalMs = [int]$script:SettingsUI.numPoll.Value
         $script:Config.githubRepo = $script:SettingsUI.txtRepo.Text.Trim()
         $script:Config.githubBranch = $script:SettingsUI.txtBranch.Text.Trim()
@@ -1500,7 +1601,7 @@ function Show-SettingsWindow {
         $script:TemplatesDir = $script:Config.templatesDir
         if (-not (Test-Path $script:IpcDir)) { New-Item -ItemType Directory -Path $script:IpcDir -Force | Out-Null }
         if ($script:IpcTimer) { $script:IpcTimer.Interval = $script:Config.pollIntervalMs }
-        Write-BridgeLog "Settings saved and applied (poll=$($script:Config.pollIntervalMs)ms)."
+        Write-BridgeLog "Settings saved and applied (poll=$($script:Config.pollIntervalMs)ms, tsExe='$($script:Config.topsolidExe)')."
         Show-TrayBalloon "Settings Saved" "Bridge configuration updated." "Info"
         if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) { $script:SettingsForm.Close() }
     })
@@ -1508,7 +1609,7 @@ function Show-SettingsWindow {
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point((S 446), (S 458))
+    $btnCancel.Location = New-Object System.Drawing.Point((S 446), (S 538))
     $btnCancel.Size = New-Object System.Drawing.Size((S 100), (S 34))
     $btnCancel.Add_Click({
         if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) { $script:SettingsForm.Close() }
@@ -1518,6 +1619,7 @@ function Show-SettingsWindow {
     $script:SettingsUI = @{
         txtIpc       = $txtIpc
         txtTpl       = $txtTpl
+        cmbTsVer     = $cmbTsVer
         numPoll      = $numPoll
         chkNotif     = $chkNotif
         txtRepo      = $txtRepo
@@ -1563,6 +1665,9 @@ $miRestart.Add_Click({ Restart-BridgeProcess })
 
 $miUpdate = New-Object System.Windows.Forms.ToolStripMenuItem("Check for Updates (GitHub)...")
 $miUpdate.Add_Click({ Show-UpdateCheckDialog $false })
+
+$miRebuildTpl = New-Object System.Windows.Forms.ToolStripMenuItem("Rebuild Templates (B&&S_*.top)...")
+$miRebuildTpl.Add_Click({ Invoke-RebuildTemplates $script:TemplatesDir $script:Config.topsolidExe })
 
 $miService = New-Object System.Windows.Forms.ToolStripMenuItem("Install as Service (Autostart)")
 $miService.Add_Click({
@@ -1628,6 +1733,7 @@ $menu.Add_Opening({
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void]$menu.Items.Add($miPause)
 [void]$menu.Items.Add($miRestart)
+[void]$menu.Items.Add($miRebuildTpl)
 [void]$menu.Items.Add($miUpdate)
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void]$menu.Items.Add($miService)

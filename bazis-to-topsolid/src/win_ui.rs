@@ -587,7 +587,25 @@ fn resolve_mcp_bridge_ps1() -> Option<std::path::PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn read_configured_topsolid_exe() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    let cfg_path = std::path::PathBuf::from(appdata)
+        .join("TopSolid6MCP")
+        .join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let s = val.get("topsolidExe")?.as_str()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let p = std::path::PathBuf::from(s);
+    if p.exists() { Some(p) } else { None }
+}
+
 fn resolve_topsolid_exe() -> Option<std::path::PathBuf> {
+    if let Some(cfg_exe) = read_configured_topsolid_exe() {
+        return Some(cfg_exe);
+    }
     let candidates = [
         r"C:\Missler\V625\bin\top625.exe",
         r"C:\Missler\V624\bin\top624.exe",
