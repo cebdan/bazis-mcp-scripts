@@ -4,7 +4,13 @@ Zero-dependency MCP stdio server + Windows System Tray COM bridge for **TopSolid
 communicating via atomic Shared-Folder IPC (`.ts6-ipc/` — works seamlessly across macOS + Parallels / MEGA sync
 or locally on Windows).
 
-## Features (v0.2.1)
+## Features (v0.3.0)
+- **Network Mode — MCP Streamable HTTP (`server/http.mjs`, port `8765`):**
+  - Connects Claude Code / Antigravity on macOS (Parallels host) or LAN directly to Windows over HTTP (`http://<Windows-IP>:8765/mcp`) — no fragile MEGA/shared-folder IPC sync required.
+  - Zero external npm dependencies (`node:http`, `node:fs`, `node:crypto`), stateless MCP Streamable HTTP (`2025-03-26` / `2025-06-18`), `GET /healthz` unauthenticated health check, mandatory `Authorization: Bearer <token>` (`timingSafeEqual`), `Origin` DNS-rebinding guard, IP/CIDR allowlist (`127.0.0.1`, `::1`, Parallels `10.211.55.0/24`, `10.37.129.0/24`, RFC1918 LAN).
+  - Auto-started and supervised by `ts6_bridge.ps1` (auto-restarts on crash, max 5/min, stopped cleanly on exit).
+  - **stdio → HTTP proxy** (`node server/index.mjs --remote <url> --token <token>`) for stdio-only MCP clients, plus full backwards-compatibility with legacy stdio + shared `.ts6-ipc/`.
+  - **Stale IPC Request Guard**: clients stamp `ts` + `deadline`; bridge skips expired `req-*.json` (`SKIP stale`) and prunes `res-*.json` older than 10 minutes on startup.
 - **System Tray Application** (zero console window flash via `ts6_tray_launcher.vbs`, single-instance lock):
   - **Dynamic Status Icon**: green dot when TopSolid is open, amber when waiting for TopSolid, gray when paused.
   - **Left-click**: opens **Information & Live Status** window (version, PID, uptime, request/error stats, TopSolid COM health, service/Start Menu status, live activity log, and one-click **Copy MCP Config**).
@@ -54,3 +60,56 @@ or locally on Windows).
    ```
 4. **Uninstall Service & Start Menu:**
    Double-click `Uninstall_TopSolid6_MCP.bat` (or toggle directly from the Tray right-click menu / Settings).
+
+## Network Mode (Streamable HTTP)
+
+```
+ Mac (Claude Code / Antigravity)     Windows VM (Parallels) / Windows PC
+ ───────────────────────────────     ──────────────────────────────────────────────────────────
+                                     ┌──────────────────────────┐   local IPC     ┌──────────────────────┐
+ HTTP POST /mcp  ──────────────────► │ server/http.mjs (Node)   │ ─ C:\…\.ts6-ipc │ ts6_bridge.ps1 (tray)│ ─► COM ─► TopSolid 6
+ Authorization: Bearer <TOKEN>       │ MCP Streamable HTTP      │ ◄────────────── │ (interactive desktop)│
+                                     │ 0.0.0.0:8765             │                 └──────────────────────┘
+ Windows client  ──────────────────► │ (127.0.0.1:8765)         │
+                                     └──────────────────────────┘
+ Legacy mode: stdio index.mjs ── shared .ts6-ipc ── bridge  (still supported)
+```
+
+### Firewall (Windows, Private/Domain networks only)
+Installed automatically when running `Install-BridgeService` as Administrator, or run once in an elevated Command Prompt:
+```cmd
+netsh advfirewall firewall add rule name="TopSolid MCP HTTP" dir=in action=allow protocol=TCP localport=8765 profile=private,domain
+```
+
+### Client Configurations
+Find your Windows VM IP with `ipconfig` (Parallels Shared Network is typically `10.211.55.x`; reserve a static IP in Parallels Network settings). Copy your Bearer token from **Tray → Settings… → Network (HTTP MCP) → Copy Client Config**.
+
+**Claude Code on macOS (host → Windows VM):**
+```bash
+claude mcp add --transport http --scope user topsolid6 http://10.211.55.X:8765/mcp --header "Authorization: Bearer <TOKEN>"
+```
+*(Remove any old stdio entry first with `claude mcp remove topsolid6 --scope user`.)*
+
+**Claude Code on Windows (local VM/PC):**
+```bash
+claude mcp add --transport http --scope user topsolid6 http://127.0.0.1:8765/mcp --header "Authorization: Bearer <TOKEN>"
+```
+
+**stdio-only MCP Client Fallback (macOS / Windows / Linux, including Antigravity `mcp_config.json`):**
+```json
+{
+  "mcpServers": {
+    "topsolid6": {
+      "command": "node",
+      "args": ["<repo>/server/index.mjs", "--remote", "http://10.211.55.X:8765/mcp"],
+      "env": { "TS6_HTTP_TOKEN": "<TOKEN>" }
+    }
+  }
+}
+```
+*(Antigravity `mcp_config.json` also supports remote HTTP servers via `serverUrl` + `headers`: `{ "serverUrl": "http://10.211.55.X:8765/mcp", "headers": { "Authorization": "Bearer <TOKEN>" } }`; if your client version requires stdio, use the `--remote` proxy above.)*
+
+## Troubleshooting
+- **Mac cannot reach Windows port 8765:** check `ping <IP VM>`; ensure Windows network profile is **Private** (`Get-NetConnectionProfile`); verify the firewall rule; check `netstat -ano | findstr 8765`.
+- **`/healthz` returns 200 OK, but `tools/call` times out:** the Windows tray bridge is not running/paused, or the HTTP gateway and bridge are using different `ipcDir` paths (`ts6_bridge_info` `ipcDir` must match `TS6_IPC_DIR`).
+- **Parallels VM IP changes after VM recreate:** assign a DHCP reservation in Parallels Settings → Network or set a static IPv4 address in Windows.

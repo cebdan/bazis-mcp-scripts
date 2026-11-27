@@ -180,6 +180,21 @@ function handleCommand(cmd, params) {
   throw new Error("Unknown TopSolid 6 command: " + cmd);
 }
 
+function cleanupOldResponses() {
+  try {
+    if (!fs.existsSync(IPC_DIR)) return;
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const f of fs.readdirSync(IPC_DIR)) {
+      if (f.startsWith("res-") && f.endsWith(".json")) {
+        const p = path.join(IPC_DIR, f);
+        try {
+          if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p);
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
 function poll() {
   try {
     const files = fs.readdirSync(IPC_DIR).filter((f) => f.startsWith("req-") && f.endsWith(".json"));
@@ -192,6 +207,10 @@ function poll() {
       try {
         const req = JSON.parse(fs.readFileSync(reqPath, "utf8"));
         try { fs.unlinkSync(reqPath); } catch {}
+        if (typeof req.deadline === "number" && Date.now() > req.deadline) {
+          console.log(`[ts6-bridge] SKIP stale ${req.cmd} (id=${id})`);
+          continue;
+        }
         const result = handleCommand(req.cmd, req.params);
         payload = { id, ok: true, result };
       } catch (err) {
@@ -206,6 +225,7 @@ function poll() {
   }
 }
 
+cleanupOldResponses();
 console.log("[ts6-bridge] TopSolid 6.25 COM bridge started.");
 console.log("[ts6-bridge] IPC dir: " + IPC_DIR);
 console.log("[ts6-bridge] Templates dir: " + TEMPLATES_DIR);

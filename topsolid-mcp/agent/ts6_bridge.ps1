@@ -76,7 +76,29 @@ if (Test-Path $script:VersionFile) {
 $script:DefaultIpcDir = Join-Path $script:RepoRoot ".ts6-ipc"
 $script:DefaultTemplatesDir = Join-Path (Split-Path -Parent (Split-Path -Parent $script:RepoRoot)) "bazis\TopSolid_Templates"
 
+function New-RandomHttpToken {
+    $bytes = New-Object byte[] 32
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    return ([Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_'))
+}
+
+function Resolve-NodeExe([string]$configured = "") {
+    if ($configured -and (Test-Path $configured)) { return $configured }
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    foreach ($cand in @(
+        "C:\Program Files\nodejs\node.exe",
+        "C:\Program Files (x86)\nodejs\node.exe",
+        (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe")
+    )) {
+        if ($cand -and (Test-Path $cand)) { return $cand }
+    }
+    return "node.exe"
+}
+
 function Load-BridgeConfig {
+    $defaultAllow = @("127.0.0.1", "::1", "10.211.55.0/24", "10.37.129.0/24", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12")
     $cfg = [ordered]@{
         ipcDir            = $script:DefaultIpcDir
         templatesDir      = $script:DefaultTemplatesDir
@@ -86,7 +108,14 @@ function Load-BridgeConfig {
         githubBranch      = $script:DefaultBranch
         autoCheckUpdates  = $true
         showNotifications = $true
+        httpEnabled       = $true
+        httpHost          = "0.0.0.0"
+        httpPort          = 8765
+        httpToken         = ""
+        httpAllowFrom     = $defaultAllow
+        nodeExe           = ""
     }
+    $needSave = $false
     if (Test-Path $script:ConfigPath) {
         try {
             $saved = [System.IO.File]::ReadAllText($script:ConfigPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -98,11 +127,37 @@ function Load-BridgeConfig {
             if ($saved.githubBranch) { $cfg.githubBranch = [string]$saved.githubBranch }
             if ($null -ne $saved.autoCheckUpdates) { $cfg.autoCheckUpdates = [bool]$saved.autoCheckUpdates }
             if ($null -ne $saved.showNotifications) { $cfg.showNotifications = [bool]$saved.showNotifications }
+            if ($null -ne $saved.httpEnabled) { $cfg.httpEnabled = [bool]$saved.httpEnabled }
+            if ($saved.httpHost) { $cfg.httpHost = [string]$saved.httpHost }
+            if ($null -ne $saved.httpPort -and [int]$saved.httpPort -gt 0) { $cfg.httpPort = [int]$saved.httpPort }
+            if ($null -ne $saved.httpToken) { $cfg.httpToken = [string]$saved.httpToken }
+            if ($null -ne $saved.httpAllowFrom -and @($saved.httpAllowFrom).Count -gt 0) {
+                $cfg.httpAllowFrom = @($saved.httpAllowFrom | ForEach-Object { [string]$_ })
+            }
+            if ($null -ne $saved.nodeExe) { $cfg.nodeExe = [string]$saved.nodeExe }
         } catch {}
+    } else {
+        $needSave = $true
+    }
+    if (-not $cfg.httpToken) {
+        $cfg.httpToken = New-RandomHttpToken
+        $needSave = $true
+    }
+    if (-not $cfg.nodeExe) {
+        $cfg.nodeExe = Resolve-NodeExe ""
     }
     if ($env:TS6_IPC_DIR) { $cfg.ipcDir = $env:TS6_IPC_DIR }
     if ($env:TS6_TEMPLATES_DIR) { $cfg.templatesDir = $env:TS6_TEMPLATES_DIR }
     if ($env:TS6_TOPSOLID_EXE) { $cfg.topsolidExe = $env:TS6_TOPSOLID_EXE }
+    if ($env:TS6_HTTP_HOST) { $cfg.httpHost = $env:TS6_HTTP_HOST }
+    if ($env:TS6_HTTP_PORT) { $cfg.httpPort = [int]$env:TS6_HTTP_PORT }
+    if ($env:TS6_HTTP_TOKEN) { $cfg.httpToken = $env:TS6_HTTP_TOKEN }
+    if ($needSave) {
+        try {
+            $json = $cfg | ConvertTo-Json -Depth 5
+            [System.IO.File]::WriteAllText($script:ConfigPath, $json, $script:Utf8NoBom)
+        } catch {}
+    }
     return $cfg
 }
 
@@ -166,6 +221,157 @@ $script:Config = Load-BridgeConfig
 $script:IpcDir = $script:Config.ipcDir
 $script:TemplatesDir = $script:Config.templatesDir
 if (-not (Test-Path $script:IpcDir)) { New-Item -ItemType Directory -Path $script:IpcDir -Force | Out-Null }
+
+# Clean up stale res-*.json older than 10 minutes on startup
+try {
+    $cutoff = (Get-Date).AddMinutes(-10)
+    Get-ChildItem -Path $script:IpcDir -Filter "res-*.json" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+
+# HTTP MCP Gateway process state & watchdog
+$script:HttpProc = $null
+$script:HttpLastError = ""
+$script:HttpRestartTimes = New-Object System.Collections.Generic.List[DateTime]
+$script:HttpNextRestartAt = [DateTime]::MinValue
+
+function Get-LocalIPv4List {
+    $ips = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+            if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
+            if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback) { continue }
+            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
+                if ($ua.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                    $s = $ua.Address.IPAddressToString
+                    if ($s -and -not $s.StartsWith("169.254.") -and -not $ips.Contains($s)) {
+                        $ips.Add($s)
+                    }
+                }
+            }
+        }
+    } catch {}
+    if (-not $ips.Contains("127.0.0.1")) { $ips.Add("127.0.0.1") }
+    return @($ips)
+}
+
+function Get-HttpGatewayStatus {
+    $port = [int]$script:Config.httpPort
+    $ips = Get-LocalIPv4List
+    $urls = @($ips | ForEach-Object { "http://$($_):$port/mcp" })
+    $primary = if ($urls.Count -gt 0) { $urls[0] } else { "http://127.0.0.1:$port/mcp" }
+    $running = ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited)
+    $hpid = if ($running) { $script:HttpProc.Id } else { 0 }
+    return @{
+        enabled   = [bool]$script:Config.httpEnabled
+        listening = $running
+        url       = $primary
+        urls      = $urls
+        pid       = $hpid
+        lastError = $script:HttpLastError
+    }
+}
+
+function Stop-HttpGateway {
+    if ($null -ne $script:HttpProc) {
+        try {
+            if (-not $script:HttpProc.HasExited) {
+                $script:HttpProc.Kill()
+                $script:HttpProc.WaitForExit(2000) | Out-Null
+            }
+        } catch {}
+        try { $script:HttpProc.Dispose() } catch {}
+        $script:HttpProc = $null
+    }
+}
+
+function Start-HttpGateway {
+    Stop-HttpGateway
+    $script:HttpLastError = ""
+    if (-not $script:Config.httpEnabled) { return }
+    # Clean up any orphaned HTTP gateway process from a previous abrupt exit
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*server*index.mjs*--http*"
+        } | ForEach-Object {
+            try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+    $serverEntry = Join-Path $script:RepoRoot "server\index.mjs"
+    if (-not (Test-Path $serverEntry)) {
+        $script:HttpLastError = "server/index.mjs not found at $serverEntry"
+        Write-BridgeLog "HTTP Gateway: $($script:HttpLastError)" "ERROR"
+        return
+    }
+    $nodeBin = Resolve-NodeExe $script:Config.nodeExe
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $nodeBin
+        $psi.Arguments = "`"$serverEntry`" --http"
+        $psi.WorkingDirectory = $script:RepoRoot
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.EnvironmentVariables["TS6_IPC_DIR"] = $script:IpcDir
+        $psi.EnvironmentVariables["TS6_HTTP_HOST"] = [string]$script:Config.httpHost
+        $psi.EnvironmentVariables["TS6_HTTP_PORT"] = [string]$script:Config.httpPort
+        $psi.EnvironmentVariables["TS6_HTTP_TOKEN"] = [string]$script:Config.httpToken
+        $psi.EnvironmentVariables["TS6_HTTP_ALLOW_FROM"] = (@($script:Config.httpAllowFrom) -join ",")
+        $psi.EnvironmentVariables["TS6_LOG_PATH"] = $script:LogPath
+        $psi.EnvironmentVariables["TS6_CONFIG_PATH"] = $script:ConfigPath
+        $script:HttpProc = [System.Diagnostics.Process]::Start($psi)
+        Write-BridgeLog "HTTP MCP Gateway started (PID=$($script:HttpProc.Id), http://$($script:Config.httpHost):$($script:Config.httpPort)/mcp, IPC=$($script:IpcDir))."
+    } catch {
+        $script:HttpLastError = $_.Exception.Message
+        Write-BridgeLog "HTTP Gateway start failed: $($script:HttpLastError)" "ERROR"
+    }
+}
+
+function Ensure-HttpGatewayAlive {
+    if (-not $script:Config.httpEnabled) { return }
+    if ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited) { return }
+    $now = Get-Date
+    if ($now -lt $script:HttpNextRestartAt) { return }
+    # Cap restarts at 5 per minute
+    for ($i = $script:HttpRestartTimes.Count - 1; $i -ge 0; $i--) {
+        if (($now - $script:HttpRestartTimes[$i]).TotalSeconds -gt 60) {
+            $script:HttpRestartTimes.RemoveAt($i)
+        }
+    }
+    if ($script:HttpRestartTimes.Count -ge 5) {
+        $script:HttpLastError = "Restart rate limit reached (5/min)"
+        return
+    }
+    $script:HttpRestartTimes.Add($now)
+    $script:HttpNextRestartAt = $now.AddSeconds(3)
+    Write-BridgeLog "HTTP Gateway exited; restarting..." "WARN"
+    Start-HttpGateway
+}
+
+function Build-ClientConfigText {
+    $port = [int]$script:Config.httpPort
+    $tok = [string]$script:Config.httpToken
+    $ips = Get-LocalIPv4List
+    $vmIp = ($ips | Where-Object { $_ -ne "127.0.0.1" } | Select-Object -First 1)
+    if (-not $vmIp) { $vmIp = "127.0.0.1" }
+    $lines = @(
+        "# Claude Code (Mac -> Windows VM):",
+        "claude mcp add --transport http --scope user topsolid6 http://$($vmIp):$port/mcp --header `"Authorization: Bearer $tok`"",
+        "",
+        "# Claude Code (Windows local):",
+        "claude mcp add --transport http --scope user topsolid6 http://127.0.0.1:$port/mcp --header `"Authorization: Bearer $tok`"",
+        "",
+        "# stdio-only MCP client fallback (JSON):",
+        "{",
+        "  `"mcpServers`": {",
+        "    `"topsolid6`": {",
+        "      `"command`": `"node`",",
+        "      `"args`": [`"<repo>/server/index.mjs`", `"--remote`", `"http://$($vmIp):$port/mcp`"],",
+        "      `"env`": { `"TS6_HTTP_TOKEN`": `"$tok`" }",
+        "    }",
+        "  }",
+        "}"
+    )
+    return ($lines -join "`r`n")
+}
 
 # ============================================================================
 # Logging & Telemetry State
@@ -239,6 +445,19 @@ function Install-BridgeService {
         -Description "TopSolid MCP Bridge (Interactive COM + System Tray Service)" `
         -Force | Out-Null
     Write-BridgeLog "Installed Windows service task '$($script:TaskName)' (AtLogOn, interactive, auto-restart)."
+    $fwPort = [int]$script:Config.httpPort
+    $fwCmd = "netsh advfirewall firewall add rule name=`"TopSolid MCP HTTP`" dir=in action=allow protocol=TCP localport=$fwPort profile=private,domain"
+    try {
+        $null = netsh advfirewall firewall delete rule name="TopSolid MCP HTTP" 2>$null
+        $fwOut = netsh advfirewall firewall add rule name="TopSolid MCP HTTP" dir=in action=allow protocol=TCP localport=$fwPort profile=private,domain 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-BridgeLog "Added Windows Firewall rule 'TopSolid MCP HTTP' (TCP $fwPort, private+domain)."
+        } else {
+            Write-BridgeLog "Firewall rule requires Administrator rights. Run manually in elevated cmd: $fwCmd" "WARN"
+        }
+    } catch {
+        Write-BridgeLog "Firewall rule requires Administrator rights. Run manually: $fwCmd" "WARN"
+    }
 }
 
 function Uninstall-BridgeService {
@@ -248,6 +467,7 @@ function Uninstall-BridgeService {
             Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false
             Write-BridgeLog "Removed Windows service task '$($script:TaskName)'."
         }
+        try { $null = netsh advfirewall firewall delete rule name="TopSolid MCP HTTP" 2>$null } catch {}
     } catch {
         throw ("Failed to remove service task: " + $_.Exception.Message)
     }
@@ -587,6 +807,7 @@ function HandleCommand([string]$cmd, $p) {
             logPath         = $script:LogPath
             service         = $svc
             startMenu       = $sm
+            http            = (Get-HttpGatewayStatus)
             topSolidRunning = [bool](Get-TopSolidProcess)
             lastUpdateCheck = $script:LastUpdateResult
         }
@@ -837,6 +1058,13 @@ function Process-IpcQueue {
             Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
             $req = $raw | ConvertFrom-Json
             $cmdName = [string]$req.cmd
+            if ($null -ne $req.deadline) {
+                $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+                if ($nowMs -gt [int64]$req.deadline) {
+                    Write-BridgeLog "SKIP stale $cmdName (id=$id, expired by $($nowMs - [int64]$req.deadline) ms)" "WARN"
+                    continue
+                }
+            }
             $script:LastCommand = $cmdName
             $script:LastCommandTime = Get-Date
             $res = HandleCommand $cmdName $req.params
@@ -867,9 +1095,19 @@ if ($NoTray) {
     Write-BridgeLog "TopSolid MCP Bridge v$($script:AppVersion) running (console mode)."
     Write-BridgeLog "IPC dir:       $($script:IpcDir)"
     Write-BridgeLog "Templates dir: $($script:TemplatesDir)"
-    while ($true) {
-        Process-IpcQueue
-        Start-Sleep -Milliseconds $script:Config.pollIntervalMs
+    Start-HttpGateway
+    try {
+        $lastWatch = Get-Date
+        while ($true) {
+            Process-IpcQueue
+            if (((Get-Date) - $lastWatch).TotalSeconds -ge 5) {
+                Ensure-HttpGatewayAlive
+                $lastWatch = Get-Date
+            }
+            Start-Sleep -Milliseconds $script:Config.pollIntervalMs
+        }
+    } finally {
+        Stop-HttpGateway
     }
 }
 
@@ -1095,9 +1333,18 @@ function Update-InfoWindowUI([bool]$probeCom = $false) {
     }
     $bridgeState = if ($script:IsPaused) { "PAUSED" } else { "RUNNING" }
     $lastCmdStr = if ($script:LastCommandTime) { "$($script:LastCommand) at $($script:LastCommandTime.ToString('HH:mm:ss'))" } else { "None" }
+    $httpSt = Get-HttpGatewayStatus
+    $httpStr = if (-not $httpSt.enabled) {
+        "Disabled"
+    } elseif ($httpSt.listening) {
+        "LISTENING (PID $($httpSt.pid)) | $($httpSt.urls -join ', ')"
+    } else {
+        "STOPPED ($($httpSt.lastError))"
+    }
 
     $lines = @(
         "Bridge Status : $bridgeState  (Uptime: $upStr, Poll: $($script:Config.pollIntervalMs) ms)",
+        "HTTP MCP      : $httpStr",
         "Requests      : $($script:RequestCount) OK / $($script:ErrorCount) errors  |  Last: $lastCmdStr",
         "TopSolid      : $tsInfo",
         "Service       : $svcStr",
@@ -1313,8 +1560,9 @@ function Show-SettingsWindow {
 
     $form = New-Object System.Windows.Forms.Form
     $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $form.AutoScroll = $true
     $form.Text = "TopSolid MCP Bridge - Settings"
-    $form.ClientSize = New-Object System.Drawing.Size((S 560), (S 585))
+    $form.ClientSize = New-Object System.Drawing.Size((S 580), (S 650))
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
     $form.StartPosition = "CenterScreen"
@@ -1580,10 +1828,118 @@ function Show-SettingsWindow {
         }
     })
 
+    # --- Group 4: Network (HTTP MCP) ---
+    $grpNet = New-Object System.Windows.Forms.GroupBox
+    $grpNet.Text = "Network (HTTP MCP Streamable Gateway)"
+    $grpNet.Location = New-Object System.Drawing.Point((S 14), (S 534))
+    $grpNet.Size = New-Object System.Drawing.Size((S 532), (S 182))
+    $form.Controls.Add($grpNet)
+
+    $chkHttpEnabled = New-Object System.Windows.Forms.CheckBox
+    $chkHttpEnabled.Text = "Enable HTTP MCP Gateway"
+    $chkHttpEnabled.Checked = [bool]$script:Config.httpEnabled
+    $chkHttpEnabled.Location = New-Object System.Drawing.Point((S 14), (S 26))
+    $chkHttpEnabled.AutoSize = $true
+    $grpNet.Controls.Add($chkHttpEnabled)
+
+    $lblHttpHost = New-Object System.Windows.Forms.Label
+    $lblHttpHost.Text = "Host:"
+    $lblHttpHost.Location = New-Object System.Drawing.Point((S 228), (S 28))
+    $lblHttpHost.Size = New-Object System.Drawing.Size((S 40), (S 22))
+    $grpNet.Controls.Add($lblHttpHost)
+
+    $txtHttpHost = New-Object System.Windows.Forms.TextBox
+    $txtHttpHost.Text = [string]$script:Config.httpHost
+    $txtHttpHost.Location = New-Object System.Drawing.Point((S 270), (S 25))
+    $txtHttpHost.Size = New-Object System.Drawing.Size((S 104), (S 24))
+    $grpNet.Controls.Add($txtHttpHost)
+
+    $lblHttpPort = New-Object System.Windows.Forms.Label
+    $lblHttpPort.Text = "Port:"
+    $lblHttpPort.Location = New-Object System.Drawing.Point((S 384), (S 28))
+    $lblHttpPort.Size = New-Object System.Drawing.Size((S 38), (S 22))
+    $grpNet.Controls.Add($lblHttpPort)
+
+    $numHttpPort = New-Object System.Windows.Forms.NumericUpDown
+    $numHttpPort.Minimum = 1024
+    $numHttpPort.Maximum = 65535
+    $numHttpPort.Value = [Math]::Min(65535, [Math]::Max(1024, [int]$script:Config.httpPort))
+    $numHttpPort.Location = New-Object System.Drawing.Point((S 424), (S 25))
+    $numHttpPort.Size = New-Object System.Drawing.Size((S 94), (S 24))
+    $grpNet.Controls.Add($numHttpPort)
+
+    $lblTok = New-Object System.Windows.Forms.Label
+    $lblTok.Text = "Bearer Token:"
+    $lblTok.Location = New-Object System.Drawing.Point((S 14), (S 64))
+    $lblTok.Size = New-Object System.Drawing.Size((S 98), (S 22))
+    $grpNet.Controls.Add($lblTok)
+
+    $txtHttpToken = New-Object System.Windows.Forms.TextBox
+    $txtHttpToken.Text = [string]$script:Config.httpToken
+    $txtHttpToken.UseSystemPasswordChar = $true
+    $txtHttpToken.ReadOnly = $true
+    $txtHttpToken.Location = New-Object System.Drawing.Point((S 116), (S 61))
+    $txtHttpToken.Size = New-Object System.Drawing.Size((S 184), (S 24))
+    $grpNet.Controls.Add($txtHttpToken)
+
+    $btnShowTok = New-Object System.Windows.Forms.Button
+    $btnShowTok.Text = "Show"
+    $btnShowTok.Location = New-Object System.Drawing.Point((S 306), (S 59))
+    $btnShowTok.Size = New-Object System.Drawing.Size((S 58), (S 28))
+    $btnShowTok.Add_Click({
+        $t = $script:SettingsUI.txtHttpToken
+        $t.UseSystemPasswordChar = (-not $t.UseSystemPasswordChar)
+        $script:SettingsUI.btnShowTok.Text = if ($t.UseSystemPasswordChar) { "Show" } else { "Hide" }
+    })
+    $grpNet.Controls.Add($btnShowTok)
+
+    $btnCopyTok = New-Object System.Windows.Forms.Button
+    $btnCopyTok.Text = "Copy"
+    $btnCopyTok.Location = New-Object System.Drawing.Point((S 368), (S 59))
+    $btnCopyTok.Size = New-Object System.Drawing.Size((S 58), (S 28))
+    $btnCopyTok.Add_Click({
+        try { [System.Windows.Forms.Clipboard]::SetText($script:SettingsUI.txtHttpToken.Text) } catch {}
+        Show-TrayBalloon "Token Copied" "Bearer token copied to clipboard." "Info"
+    })
+    $grpNet.Controls.Add($btnCopyTok)
+
+    $btnRegenTok = New-Object System.Windows.Forms.Button
+    $btnRegenTok.Text = "Regenerate"
+    $btnRegenTok.Location = New-Object System.Drawing.Point((S 430), (S 59))
+    $btnRegenTok.Size = New-Object System.Drawing.Size((S 88), (S 28))
+    $btnRegenTok.Add_Click({
+        $script:SettingsUI.txtHttpToken.Text = New-RandomHttpToken
+    })
+    $grpNet.Controls.Add($btnRegenTok)
+
+    $lblAllow = New-Object System.Windows.Forms.Label
+    $lblAllow.Text = "Allow IPs:"
+    $lblAllow.Location = New-Object System.Drawing.Point((S 14), (S 100))
+    $lblAllow.Size = New-Object System.Drawing.Size((S 98), (S 22))
+    $grpNet.Controls.Add($lblAllow)
+
+    $txtHttpAllow = New-Object System.Windows.Forms.TextBox
+    $txtHttpAllow.Text = (@($script:Config.httpAllowFrom) -join ", ")
+    $txtHttpAllow.Location = New-Object System.Drawing.Point((S 116), (S 97))
+    $txtHttpAllow.Size = New-Object System.Drawing.Size((S 402), (S 24))
+    $grpNet.Controls.Add($txtHttpAllow)
+
+    $btnCopyClientCfg = New-Object System.Windows.Forms.Button
+    $btnCopyClientCfg.Text = "Copy Client Config (Mac / Windows / stdio)"
+    $btnCopyClientCfg.Location = New-Object System.Drawing.Point((S 116), (S 134))
+    $btnCopyClientCfg.Size = New-Object System.Drawing.Size((S 310), (S 32))
+    $btnCopyClientCfg.Add_Click({
+        $script:Config.httpPort = [int]$script:SettingsUI.numHttpPort.Value
+        $script:Config.httpToken = $script:SettingsUI.txtHttpToken.Text.Trim()
+        try { [System.Windows.Forms.Clipboard]::SetText((Build-ClientConfigText)) } catch {}
+        Show-TrayBalloon "Client Config Copied" "Ready-to-use Claude Code / MCP client configs copied to clipboard." "Info"
+    })
+    $grpNet.Controls.Add($btnCopyClientCfg)
+
     # --- Save / Cancel ---
     $btnSave = New-Object System.Windows.Forms.Button
     $btnSave.Text = "Save & Apply"
-    $btnSave.Location = New-Object System.Drawing.Point((S 326), (S 538))
+    $btnSave.Location = New-Object System.Drawing.Point((S 326), (S 728))
     $btnSave.Size = New-Object System.Drawing.Size((S 112), (S 34))
     $btnSave.Add_Click({
         $script:Config.ipcDir = $script:SettingsUI.txtIpc.Text.Trim()
@@ -1595,21 +1951,28 @@ function Show-SettingsWindow {
         $script:Config.githubBranch = $script:SettingsUI.txtBranch.Text.Trim()
         $script:Config.autoCheckUpdates = [bool]$script:SettingsUI.chkAutoUpd.Checked
         $script:Config.showNotifications = [bool]$script:SettingsUI.chkNotif.Checked
+        $script:Config.httpEnabled = [bool]$script:SettingsUI.chkHttpEnabled.Checked
+        $script:Config.httpHost = $script:SettingsUI.txtHttpHost.Text.Trim()
+        $script:Config.httpPort = [int]$script:SettingsUI.numHttpPort.Value
+        $script:Config.httpToken = $script:SettingsUI.txtHttpToken.Text.Trim()
+        $allowRaw = $script:SettingsUI.txtHttpAllow.Text.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        if (@($allowRaw).Count -gt 0) { $script:Config.httpAllowFrom = @($allowRaw) }
         Save-BridgeConfig $script:Config
 
         $script:IpcDir = $script:Config.ipcDir
         $script:TemplatesDir = $script:Config.templatesDir
         if (-not (Test-Path $script:IpcDir)) { New-Item -ItemType Directory -Path $script:IpcDir -Force | Out-Null }
         if ($script:IpcTimer) { $script:IpcTimer.Interval = $script:Config.pollIntervalMs }
-        Write-BridgeLog "Settings saved and applied (poll=$($script:Config.pollIntervalMs)ms, tsExe='$($script:Config.topsolidExe)')."
-        Show-TrayBalloon "Settings Saved" "Bridge configuration updated." "Info"
+        Start-HttpGateway
+        Write-BridgeLog "Settings saved and applied (poll=$($script:Config.pollIntervalMs)ms, httpEnabled=$($script:Config.httpEnabled), port=$($script:Config.httpPort))."
+        Show-TrayBalloon "Settings Saved" "Bridge & HTTP gateway configuration updated." "Info"
         if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) { $script:SettingsForm.Close() }
     })
     $form.Controls.Add($btnSave)
 
     $btnCancel = New-Object System.Windows.Forms.Button
     $btnCancel.Text = "Cancel"
-    $btnCancel.Location = New-Object System.Drawing.Point((S 446), (S 538))
+    $btnCancel.Location = New-Object System.Drawing.Point((S 446), (S 728))
     $btnCancel.Size = New-Object System.Drawing.Size((S 100), (S 34))
     $btnCancel.Add_Click({
         if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) { $script:SettingsForm.Close() }
@@ -1617,18 +1980,24 @@ function Show-SettingsWindow {
     $form.Controls.Add($btnCancel)
 
     $script:SettingsUI = @{
-        txtIpc       = $txtIpc
-        txtTpl       = $txtTpl
-        cmbTsVer     = $cmbTsVer
-        numPoll      = $numPoll
-        chkNotif     = $chkNotif
-        txtRepo      = $txtRepo
-        txtBranch    = $txtBranch
-        chkAutoUpd   = $chkAutoUpd
-        lblSvcStatus = $lblSvcStatus
-        btnSvcRemove = $btnSvcRemove
-        lblSmStatus  = $lblSmStatus
-        btnSmRemove  = $btnSmRemove
+        txtIpc         = $txtIpc
+        txtTpl         = $txtTpl
+        cmbTsVer       = $cmbTsVer
+        numPoll        = $numPoll
+        chkNotif       = $chkNotif
+        txtRepo        = $txtRepo
+        txtBranch      = $txtBranch
+        chkAutoUpd     = $chkAutoUpd
+        lblSvcStatus   = $lblSvcStatus
+        btnSvcRemove   = $btnSvcRemove
+        lblSmStatus    = $lblSmStatus
+        btnSmRemove    = $btnSmRemove
+        chkHttpEnabled = $chkHttpEnabled
+        txtHttpHost    = $txtHttpHost
+        numHttpPort    = $numHttpPort
+        txtHttpToken   = $txtHttpToken
+        btnShowTok     = $btnShowTok
+        txtHttpAllow   = $txtHttpAllow
     }
     $script:SettingsForm = $form
 
@@ -1785,8 +2154,13 @@ $script:IpcTimer.Start()
 
 $statusTimer = New-Object System.Windows.Forms.Timer
 $statusTimer.Interval = 5000
-$statusTimer.Add_Tick({ Update-TrayVisuals })
+$statusTimer.Add_Tick({
+    Ensure-HttpGatewayAlive
+    Update-TrayVisuals
+})
 $statusTimer.Start()
+
+Start-HttpGateway
 
 if ($script:Config.autoCheckUpdates) {
     $updTimer = New-Object System.Windows.Forms.Timer
@@ -1815,6 +2189,7 @@ $appContext = New-Object System.Windows.Forms.ApplicationContext
 try {
     [System.Windows.Forms.Application]::Run($appContext)
 } finally {
+    Stop-HttpGateway
     if ($script:CurrentTrayIconHandle -ne [IntPtr]::Zero) {
         [Ts6Win32]::DestroyIcon($script:CurrentTrayIconHandle) | Out-Null
     }

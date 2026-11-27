@@ -54,7 +54,7 @@ mod win_setup {
     const CB_ADDSTRING: u32 = 0x0143;
     const CB_SETCURSEL: u32 = 0x014E;
 
-    const APP_VERSION: &str = "0.2.2";
+    const APP_VERSION: &str = "0.3.0";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Embedded payload files from topsolid-mcp/
@@ -67,6 +67,8 @@ mod win_setup {
         ("agent/ts6_apply_ops.ps1", include_bytes!("../../agent/ts6_apply_ops.ps1")),
         ("agent/ts6_ensure_deps.ps1", include_bytes!("../../agent/ts6_ensure_deps.ps1")),
         ("agent/ts6_build_templates.ps1", include_bytes!("../../agent/ts6_build_templates.ps1")),
+        ("server/core.mjs", include_bytes!("../../server/core.mjs")),
+        ("server/http.mjs", include_bytes!("../../server/http.mjs")),
         ("server/index.mjs", include_bytes!("../../server/index.mjs")),
         ("Start_TopSolid6_Bridge.bat", include_bytes!("../../Start_TopSolid6_Bridge.bat")),
         ("Install_TopSolid6_MCP.bat", include_bytes!("../../Install_TopSolid6_MCP.bat")),

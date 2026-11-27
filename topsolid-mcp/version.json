@@ -1,8 +1,8 @@
 {
   "name": "topsolid-mcp",
-  "version": "0.2.2",
-  "released": "2026-11-26",
+  "version": "0.3.0",
+  "released": "2026-11-27",
   "repo": "cebdan/bazis-mcp-scripts",
   "branch": "main",
-  "changelog": "Default install dir C:\\Missler\\mcp, multi-version TopSolid 6.xx selector, on-machine B&S_*.top template builder (ts6_build_templates.ps1) with Rebuild Templates button in Setup and Tray Settings, plus bazis-to-topsolid.exe with TopSolid_Lib_Bazis hardware components, live timer/speed meter, and input lock."
+  "changelog": "Network MCP (Streamable HTTP) on Windows, bearer auth, stdio->HTTP proxy, stale IPC request guard."
 }
