@@ -1,0 +1,24 @@
+[package]
+name = "bazis-topsolid-setup"
+version = "1.4.0"
+edition = "2021"
+description = "All-in-One Windows GUI Setup Installer for Bazis -> TopSolid'Wood 6.25 Export, Auto-Numbering, and Bazis/TopSolid MCP"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1

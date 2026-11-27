@@ -1,10 +1,11 @@
 // Bazis-Mebelshchik 2022+ Script: Order Unit & Part Numbering
 //
-// Workflow:
-//   1. Prompts for <order name>.
-//   2. Highlights each top-level inserted unit (block / fragment / assembly)
-//      one by one in the 3D scene and prompts for its unit position (<pos ###>).
-//   3. Assigns sequential position numbers to all parts (panels) and renames:
+// Interactive workflow in Bazis Properties panel (free 3D orbit/zoom while reviewing):
+//   1. Highlights each top-level unit (block / fragment / assembly with panels) one by one.
+//   2. Click "Approve" to assign the shown Unit Position (default +10 step) and move to next unit.
+//   3. Click "Skip" to leave the current unit untouched and move to next unit.
+//   4. Click "Approve All Remaining" to auto-number the rest, or "Cancel" to abort.
+//   5. Renames every approved unit & its parts:
 //      - Unit: <order name> <pos ###> <position number>
 //      - Part: <position number> <part name> <pos ###>, <order name>
 //      Also updates ArtPos on every part and unit, and Article.OrderName.
@@ -26,7 +27,6 @@ function padNumber(num, width) {
 function formatPosTag(rawInput) {
     var trimmed = String(rawInput || "").trim();
     if (!trimmed) return "";
-    // If user already typed "pos 001", normalize spacing
     if (/^pos\s+/i.test(trimmed)) {
         var rest = trimmed.replace(/^pos\s+/i, "").trim();
         if (/^\d+$/.test(rest)) return POS_PREFIX + padNumber(parseInt(rest, 10), POS_PAD_DIGITS);
@@ -61,9 +61,7 @@ function collectPanels(obj, out) {
 
 function cleanBasePartName(rawName) {
     var s = String(rawName || "Panel").trim();
-    // Strip previous "<pos ###>, <order name>" suffix if script is re-run
     s = s.replace(/\s+pos\s+\S+,.*$/i, "").trim();
-    // Strip leading "<position number> " if script is re-run
     s = s.replace(/^\d+\s+/, "").trim();
     return s || "Panel";
 }
@@ -95,133 +93,202 @@ function main() {
 
     var currentOrder = "";
     try { currentOrder = String(Article.OrderName || "").trim(); } catch (e) {}
-
-    var orderPrompt = "Enter Order Name" + (currentOrder ? " (current: " + currentOrder + ")" : "") + ":";
-    var orderName = prompt(orderPrompt);
-    if (orderName === null || orderName === undefined) {
-        Action.Finish();
-        return;
-    }
-    orderName = String(orderName).trim();
-    if (!orderName && currentOrder) {
-        orderName = currentOrder;
-    }
-    if (!orderName) {
-        alert("Order Name is required. Operation cancelled.");
-        Action.Finish();
-        return;
+    if (!currentOrder) {
+        try { currentOrder = String(Article.Name || "").trim(); } catch (e) {}
     }
 
-    // Step 1: Highlight each unit in 3D and ask for its unit position
-    var assignments = [];
-    var nextPosNum = POS_START;
-    for (var i = 0; i < units.length; i++) {
-        var u = units[i];
-        var unitObj = u.obj;
-        var origName = "";
-        try { origName = String(unitObj.Name || "Unit"); } catch (e) {}
+    var state = {
+        index: 0,
+        nextPosNum: POS_START,
+        assignments: [],
+        skippedCount: 0,
+        finished: false
+    };
 
+    // Build interactive Bazis Properties panel (user can orbit/zoom 3D while approving/skipping)
+    var orderProp = Action.Properties.NewString("Order Name", currentOrder);
+    var unitProp = Action.Properties.NewString("Current Unit", "");
+    unitProp.Enabled = false;
+    var posProp = Action.Properties.NewString("Unit Position", padNumber(POS_START, POS_PAD_DIGITS));
+    var seqProp = Action.Properties.NewBool("Sequential Part Pos (1..N)", true);
+    var progressProp = Action.Properties.NewString("Progress", "");
+    progressProp.Enabled = false;
+
+    var approveBtn = Action.Properties.NewButton("Approve");
+    var skipBtn = Action.Properties.NewButton("Skip");
+    var approveAllBtn = Action.Properties.NewButton("Approve All Remaining");
+    var cancelBtn = Action.Properties.NewButton("Cancel");
+
+    function highlightCurrentUnit() {
         UnSelectAll();
-        try { unitObj.Selected = true; } catch (e) {}
+        if (state.index >= units.length) return;
+        var u = units[state.index];
+        var origName = "";
+        try { origName = String(u.obj.Name || "Unit"); } catch (e) {}
+        try { u.obj.Selected = true; } catch (e) {}
+        unitProp.Value = (state.index + 1) + "/" + units.length + ": " + origName + " (" + u.panels.length + " parts)";
+        posProp.Value = padNumber(state.nextPosNum, POS_PAD_DIGITS);
+        progressProp.Value =
+            "Approved: " + state.assignments.length +
+            " | Skipped: " + state.skippedCount +
+            " | Left: " + (units.length - state.index);
+        Action.Hint = "Review highlighted unit " + (state.index + 1) + "/" + units.length + " -> click Approve or Skip";
+    }
 
-        var suggested = padNumber(nextPosNum, POS_PAD_DIGITS);
-        var msg =
-            "Unit " + (i + 1) + " of " + units.length + " (" + origName + ", " + u.panels.length + " parts)\n" +
-            "Enter unit position number (default: " + suggested + ", type 'skip' to skip, Cancel to abort):";
-        var input = prompt(msg);
-        if (input === null || input === undefined) {
-            UnSelectAll();
+    function applyAndFinish() {
+        if (state.finished) return;
+        state.finished = true;
+        UnSelectAll();
+
+        var orderName = String(orderProp.Value || "").trim();
+        if (!orderName) {
+            state.finished = false;
+            alert("Order Name is required.");
+            return;
+        }
+
+        if (state.assignments.length === 0) {
+            alert("No units approved for numbering (skipped: " + state.skippedCount + ").");
             Action.Finish();
             return;
         }
-        var trimmed = String(input).trim();
-        if (trimmed.toLowerCase() === "skip") {
-            continue;
-        }
-        var chosenRaw = trimmed || suggested;
-        var posTag = formatPosTag(chosenRaw);
 
-        // Advance next suggested position by +POS_STEP (10) from the entered/chosen number
-        var numMatch = chosenRaw.match(/(\d+)/);
+        var numberPartsSequentially = !!seqProp.Value;
+        try { Article.OrderName = orderName; } catch (e) {}
+
+        var partPos = 1;
+        var totalParts = 0;
+
+        for (var a = 0; a < state.assignments.length; a++) {
+            var item = state.assignments[a];
+            if (!GLOBAL_PART_SEQUENCE) {
+                partPos = 1;
+            }
+
+            try { Undo.RecursiveChanging(item.obj); } catch (e) {
+                try { Undo.Changing(item.obj); } catch (e2) {}
+            }
+
+            var unitPositionNumber = item.unitIndex;
+            item.obj.Name = orderName + " " + item.posTag + " " + unitPositionNumber;
+            try { item.obj.ArtPos = String(unitPositionNumber); } catch (e) {}
+
+            for (var pIdx = 0; pIdx < item.panels.length; pIdx++) {
+                var panel = item.panels[pIdx];
+                var baseName = cleanBasePartName(panel.Name);
+                if (numberPartsSequentially) {
+                    panel.Name = partPos + " " + baseName + " " + item.posTag + ", " + orderName;
+                    try { panel.ArtPos = String(partPos); } catch (e) {}
+                    partPos++;
+                } else {
+                    var existingPos = "";
+                    try { existingPos = String(panel.ArtPos || "").trim(); } catch (e) {}
+                    panel.Name = (existingPos ? (existingPos + " ") : "") + baseName + " " + item.posTag + ", " + orderName;
+                }
+                totalParts++;
+            }
+        }
+
+        UnSelectAll();
+        Action.Commit();
+
+        alert(
+            "Done!\n" +
+            "Order: " + orderName + "\n" +
+            "Units approved: " + state.assignments.length + " (skipped: " + state.skippedCount + ")\n" +
+            "Parts updated: " + totalParts + "\n" +
+            "Sequential part positions (CNC/cutting): " + (numberPartsSequentially ? "Yes (1.." + (partPos - 1) + ")" : "No (kept existing)")
+        );
+        Action.Finish();
+    }
+
+    function approveCurrent() {
+        if (state.finished || state.index >= units.length) return;
+        var orderName = String(orderProp.Value || "").trim();
+        if (!orderName) {
+            alert("Please enter Order Name first.");
+            return;
+        }
+        var u = units[state.index];
+        var rawPos = String(posProp.Value || "").trim() || padNumber(state.nextPosNum, POS_PAD_DIGITS);
+        var posTag = formatPosTag(rawPos);
+
+        var numMatch = rawPos.match(/(\d+)/);
         if (numMatch) {
-            nextPosNum = parseInt(numMatch[1], 10) + POS_STEP;
+            state.nextPosNum = parseInt(numMatch[1], 10) + POS_STEP;
         } else {
-            nextPosNum += POS_STEP;
+            state.nextPosNum += POS_STEP;
         }
 
-        assignments.push({
-            obj: unitObj,
+        state.assignments.push({
+            obj: u.obj,
             panels: u.panels,
             posTag: posTag,
-            unitIndex: assignments.length + 1
+            unitIndex: state.assignments.length + 1
         });
+        state.index++;
+
+        if (state.index >= units.length) {
+            applyAndFinish();
+        } else {
+            highlightCurrentUnit();
+        }
     }
 
-    if (assignments.length === 0) {
-        UnSelectAll();
-        alert("No units selected for numbering.");
-        Action.Finish();
-        return;
-    }
+    approveBtn.OnClick = function () {
+        approveCurrent();
+    };
 
-    UnSelectAll();
-
-    // Step 2: Ask whether to assign sequential part positions (1..N) for cutting maps & CNC
-    var numberPartsSequentially = confirm(
-        "Assign sequential position numbers (1, 2, 3, ...) to all parts for cutting maps and CNC?\n\n" +
-        "Yes = assign sequential ArtPos (1..N) and include it in every part name.\n" +
-        "No  = keep existing part ArtPos values and update unit/order tags only."
-    );
-
-    // Step 3: Apply Order Name, Unit Names, Part Names, and optional Sequential Position Numbers
-    try { Article.OrderName = orderName; } catch (e) {}
-
-    var partPos = 1;
-    var totalParts = 0;
-
-    for (var a = 0; a < assignments.length; a++) {
-        var item = assignments[a];
-        if (!GLOBAL_PART_SEQUENCE) {
-            partPos = 1;
+    skipBtn.OnClick = function () {
+        if (state.finished || state.index >= units.length) return;
+        state.skippedCount++;
+        state.index++;
+        if (state.index >= units.length) {
+            applyAndFinish();
+        } else {
+            highlightCurrentUnit();
         }
+    };
 
-        try { Undo.RecursiveChanging(item.obj); } catch (e) {
-            try { Undo.Changing(item.obj); } catch (e2) {}
+    approveAllBtn.OnClick = function () {
+        if (state.finished) return;
+        var orderName = String(orderProp.Value || "").trim();
+        if (!orderName) {
+            alert("Please enter Order Name first.");
+            return;
         }
-
-        var unitPositionNumber = item.unitIndex;
-        // Unit name format: <order name> <pos ###> <position number>
-        item.obj.Name = orderName + " " + item.posTag + " " + unitPositionNumber;
-        try { item.obj.ArtPos = String(unitPositionNumber); } catch (e) {}
-
-        for (var pIdx = 0; pIdx < item.panels.length; pIdx++) {
-            var panel = item.panels[pIdx];
-            var baseName = cleanBasePartName(panel.Name);
-            if (numberPartsSequentially) {
-                // Part name format: <position number> <part name> <pos ###>, <order name>
-                panel.Name = partPos + " " + baseName + " " + item.posTag + ", " + orderName;
-                try { panel.ArtPos = String(partPos); } catch (e) {}
-                partPos++;
+        while (state.index < units.length) {
+            var u = units[state.index];
+            var rawPos = (state.index === 0 || state.assignments.length === 0)
+                ? (String(posProp.Value || "").trim() || padNumber(state.nextPosNum, POS_PAD_DIGITS))
+                : padNumber(state.nextPosNum, POS_PAD_DIGITS);
+            var posTag = formatPosTag(rawPos);
+            var numMatch = rawPos.match(/(\d+)/);
+            if (numMatch) {
+                state.nextPosNum = parseInt(numMatch[1], 10) + POS_STEP;
             } else {
-                var existingPos = "";
-                try { existingPos = String(panel.ArtPos || "").trim(); } catch (e) {}
-                panel.Name = (existingPos ? (existingPos + " ") : "") + baseName + " " + item.posTag + ", " + orderName;
+                state.nextPosNum += POS_STEP;
             }
-            totalParts++;
+            state.assignments.push({
+                obj: u.obj,
+                panels: u.panels,
+                posTag: posTag,
+                unitIndex: state.assignments.length + 1
+            });
+            state.index++;
         }
-    }
+        applyAndFinish();
+    };
 
-    UnSelectAll();
-    Action.Commit();
+    cancelBtn.OnClick = function () {
+        if (state.finished) return;
+        state.finished = true;
+        UnSelectAll();
+        Action.Cancel();
+    };
 
-    alert(
-        "Done!\n" +
-        "Order: " + orderName + "\n" +
-        "Units updated: " + assignments.length + "\n" +
-        "Parts updated: " + totalParts + "\n" +
-        "Sequential part positions (CNC/cutting): " + (numberPartsSequentially ? "Yes (1.." + (partPos - 1) + ")" : "No (kept existing)")
-    );
-    Action.Finish();
+    highlightCurrentUnit();
+    Action.Continue();
 }
 
 main();

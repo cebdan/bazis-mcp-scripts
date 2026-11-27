@@ -72,8 +72,13 @@ fn main() {
         };
         let auto_save = args.iter().any(|a| a == "--save");
         let include_hardware = !args.iter().any(|a| a == "--no-hardware");
+        let include_edges = !args.iter().any(|a| a == "--no-edges");
+        let selected_only = args.iter().any(|a| a == "--selected-only");
         match load_model(&json_path) {
             Ok(mut m) => {
+                if selected_only {
+                    m = m.filter_selected();
+                }
                 if let Some(pos) = args.iter().position(|a| a == "--out") {
                     if let Some(p) = args.get(pos + 1) {
                         m.save_top_path = p.clone();
@@ -85,6 +90,7 @@ fn main() {
                     mode,
                     auto_save || !m.save_top_path.is_empty(),
                     include_hardware,
+                    include_edges,
                     &cancel,
                     |d, t, msg| {
                         println!("[{}/{}] {}", d, t, msg);
@@ -141,15 +147,15 @@ mod win_gui {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, KillTimer,
-        MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer,
-        SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-        BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
-        BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST,
-        HWND_TOPMOST, IDOK, MB_ICONWARNING, MB_OKCANCEL, MB_SETFOREGROUND, MSG, SPI_GETWORKAREA,
-        SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT,
-        WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP, WS_MINIMIZEBOX,
-        WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
+        GetWindowRect, KillTimer, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+        SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+        SystemParametersInfoW, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+        BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL,
+        ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST, HWND_TOPMOST, IDNO, IDOK, IDYES,
+        MB_ICONQUESTION, MB_ICONWARNING, MB_OKCANCEL, MB_SETFOREGROUND, MB_YESNOCANCEL, MSG, SPI_GETWORKAREA, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW,
+        WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION,
+        WS_CHILD, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
     };
 
     use crate::com::to_wide_null;
@@ -165,11 +171,14 @@ mod win_gui {
     const ID_BTN_STOP: usize = 105;
     const ID_CHK_LOCK_INPUT: usize = 106;
     const ID_CHK_HARDWARE: usize = 107;
+    const ID_CHK_EDGES: usize = 108;
+    const ID_CHK_SELECTED: usize = 109;
     const ID_TIMER_METRICS: usize = 1;
 
     const WM_APP_PROGRESS: u32 = WM_APP + 1;
     const WM_APP_DONE: u32 = WM_APP + 2;
     const WM_APP_LOCK_TOPSOLID: u32 = WM_APP + 3;
+    const WM_APP_REPLACE: u32 = WM_APP + 4;
 
     struct AppState {
         hwnd_main: HWND,
@@ -177,6 +186,8 @@ mod win_gui {
         hwnd_chk_save: HWND,
         hwnd_chk_lock: HWND,
         hwnd_chk_hw: HWND,
+        hwnd_chk_edges: HWND,
+        hwnd_chk_selected: HWND,
         hwnd_progress: HWND,
         hwnd_metrics: HWND,
         hwnd_status: HWND,
@@ -291,18 +302,75 @@ mod win_gui {
         rc == IDOK
     }
 
+    fn next_available_top_path(orig: &str) -> String {
+        let p = std::path::Path::new(orig);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Export");
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("top");
+        let parent = p.parent().unwrap_or_else(|| std::path::Path::new("."));
+        for n in 2..=999 {
+            let cand = parent.join(format!("{}_{}.{}", stem, n, ext));
+            if !cand.exists() {
+                return cand.to_string_lossy().to_string();
+            }
+        }
+        orig.to_string()
+    }
+
+    /// Returns `Some(target_path)` to proceed (original for overwrite, or versioned `_2.top`),
+    /// or `None` if the user clicked Cancel.
+    fn confirm_existing_file_dialog(owner: HWND, path_str: &str) -> Option<String> {
+        if path_str.is_empty() || !std::path::Path::new(path_str).exists() {
+            return Some(path_str.to_string());
+        }
+        let alt = next_available_top_path(path_str);
+        let title = to_wide_null("Export File Already Exists");
+        let body = to_wide_null(&format!(
+            "Target file already exists:\r\n{}\r\n\r\n\
+             Yes  - Overwrite existing file\r\n\
+             No   - Save as new file:\r\n       {}\r\n\
+             Cancel - Abort export",
+            path_str, alt
+        ));
+        let rc = unsafe {
+            MessageBoxW(
+                owner,
+                body.as_ptr(),
+                title.as_ptr(),
+                MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND,
+            )
+        };
+        if rc == IDYES {
+            Some(path_str.to_string())
+        } else if rc == IDNO {
+            Some(alt)
+        } else {
+            None
+        }
+    }
+
     fn start_export_worker() {
-        let pre_hwnd = {
+        let (pre_hwnd, pre_auto_save, pre_save_path) = {
             let guard = STATE.lock().unwrap();
             let Some(st) = guard.as_ref() else { return };
             if st.running {
                 return;
             }
-            if st.model.is_none() {
+            let Some(ref m) = st.model else {
                 append_log(st.hwnd_log, "No model JSON loaded. Run export_topsolid6.js from Bazis 2022.");
                 return;
+            };
+            let chk_save = unsafe { SendMessageW(st.hwnd_chk_save, BM_GETCHECK, 0, 0) } == 1;
+            (st.hwnd_main, chk_save, m.save_top_path.clone())
+        };
+
+        // Check before export if target .top file already exists (Overwrite / Save as _2 / Cancel)
+        let resolved_save_path = if pre_auto_save && !pre_save_path.is_empty() {
+            match confirm_existing_file_dialog(pre_hwnd, &pre_save_path) {
+                Some(p) => p,
+                None => return,
             }
-            st.hwnd_main
+        } else {
+            pre_save_path
         };
 
         // Ask user to save & close open projects and warn that TopSolid will be restarted & locked
@@ -310,7 +378,7 @@ mod win_gui {
             return;
         }
 
-        let (hwnd_main, model, mode, auto_save, want_lock, include_hw, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
+        let (hwnd_main, model, mode, auto_save, want_lock, include_hw, include_edges, cancel, pending_logs, last_status, prog_cur, panels_done, ops_done) = {
             let mut guard = STATE.lock().unwrap();
             let st = match guard.as_mut() {
                 Some(s) => s,
@@ -319,7 +387,7 @@ mod win_gui {
             if st.running {
                 return;
             }
-            let model = match st.model.clone() {
+            let raw_model = match st.model.clone() {
                 Some(m) => m,
                 None => return,
             };
@@ -327,6 +395,14 @@ mod win_gui {
             let auto_save = unsafe { SendMessageW(st.hwnd_chk_save, BM_GETCHECK, 0, 0) } == 1;
             let want_lock = unsafe { SendMessageW(st.hwnd_chk_lock, BM_GETCHECK, 0, 0) } == 1;
             let include_hw = unsafe { SendMessageW(st.hwnd_chk_hw, BM_GETCHECK, 0, 0) } == 1;
+            let include_edges = unsafe { SendMessageW(st.hwnd_chk_edges, BM_GETCHECK, 0, 0) } == 1;
+            let selected_only = unsafe { SendMessageW(st.hwnd_chk_selected, BM_GETCHECK, 0, 0) } == 1;
+            let mut model = if selected_only {
+                raw_model.filter_selected()
+            } else {
+                raw_model
+            };
+            model.save_top_path = resolved_save_path;
             st.running = true;
             st.input_locked = false;
             st.start_time = Some(Instant::now());
@@ -361,9 +437,12 @@ mod win_gui {
             append_log(
                 st.hwnd_log,
                 &format!(
-                    "Preparing clean TopSolid + MCP restart for {} export ('{}')...",
+                    "Preparing clean TopSolid + MCP restart for {} export ('{}' | selected_only={}, hw={}, edges={})...",
                     if is_native { "NATIVE TopSolid'Wood" } else { "Fast Parasolid" },
-                    model.model_name
+                    model.model_name,
+                    selected_only,
+                    include_hw,
+                    include_edges
                 ),
             );
             (
@@ -377,6 +456,7 @@ mod win_gui {
                 auto_save,
                 want_lock,
                 include_hw,
+                include_edges,
                 st.cancel.clone(),
                 st.pending_logs.clone(),
                 st.last_status.clone(),
@@ -412,7 +492,7 @@ mod win_gui {
                 unsafe { PostMessageW(hwnd, WM_APP_LOCK_TOPSOLID, 0, 0) };
             }
 
-            let res = exporter::run_export(&model, mode, auto_save, include_hw, &cancel, |cur, tot, msg| {
+            let res = exporter::run_export(&model, mode, auto_save, include_hw, include_edges, &cancel, |cur, tot, msg| {
                 *prog_cur.lock().unwrap() = (cur, tot);
                 if let Some(pidx) = parse_panel_index(msg) {
                     panels_done.store(pidx, Ordering::Relaxed);
@@ -541,6 +621,20 @@ mod win_gui {
                 }
                 0
             }
+            WM_APP_REPLACE => {
+                // Another exporter instance launched from Bazis:
+                // if idle, close this old window so the new instance opens with fresh JSON;
+                // if currently exporting, bring this window to foreground and keep running.
+                let is_running = STATE.lock().unwrap().as_ref().map(|s| s.running).unwrap_or(false);
+                if is_running {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                    0
+                } else {
+                    DestroyWindow(hwnd);
+                    1
+                }
+            }
             WM_DESTROY => {
                 win_ui::uninstall_topsolid_input_lock();
                 KillTimer(hwnd, ID_TIMER_METRICS);
@@ -564,6 +658,15 @@ mod win_gui {
 
             let hinst = GetModuleHandleW(null());
             let cls_name = to_wide_null("BazisToTopSolid6Class");
+            // Single-instance guard: replace any idle previous exporter window, or focus active one
+            let existing = FindWindowW(cls_name.as_ptr(), null());
+            if !existing.is_null() {
+                let can_replace = SendMessageW(existing, WM_APP_REPLACE, 0, 0);
+                if can_replace == 0 {
+                    // Existing instance is actively exporting — keep it in front and exit
+                    return;
+                }
+            }
             let wc = WNDCLASSW {
                 style: 0,
                 lpfnWndProc: Some(wnd_proc),
@@ -597,7 +700,7 @@ mod win_gui {
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,
                 sc(660),
-                sc(548),
+                sc(600),
                 null_mut(),
                 null_mut(),
                 hinst,
@@ -696,8 +799,54 @@ mod win_gui {
             );
             SendMessageW(hwnd_chk_hw, BM_SETCHECK, 1, 0);
 
-            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 410, 114, 114, 34, ID_BTN_START);
-            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 534, 114, 94, 34, ID_BTN_STOP);
+            let hwnd_chk_edges = mk(
+                &btn_cls,
+                "Export edge banding (3D strips + ClipPanel board trim)",
+                BS_AUTOCHECKBOX as u32,
+                16,
+                174,
+                380,
+                22,
+                ID_CHK_EDGES,
+            );
+            SendMessageW(hwnd_chk_edges, BM_SETCHECK, 1, 0);
+
+            let (sel_p, sel_b, sel_h) = loaded_model
+                .as_ref()
+                .map(|m| m.selected_counts())
+                .unwrap_or((0, 0, 0));
+            let sel_total = sel_p + sel_b + sel_h;
+            let all_total = loaded_model
+                .as_ref()
+                .map(|m| m.panels.len() + m.bodies.len() + m.hardware.len())
+                .unwrap_or(0);
+            let sel_label = if sel_total > 0 {
+                format!(
+                    "Export selected objects only ({} panels, {} bodies, {} hw)",
+                    sel_p, sel_b, sel_h
+                )
+            } else {
+                "Export selected objects only (nothing selected in Bazis)".to_string()
+            };
+            let hwnd_chk_selected = mk(
+                &btn_cls,
+                &sel_label,
+                BS_AUTOCHECKBOX as u32,
+                16,
+                200,
+                390,
+                22,
+                ID_CHK_SELECTED,
+            );
+            if sel_total == 0 {
+                EnableWindow(hwnd_chk_selected, 0);
+            } else if sel_total < all_total {
+                // Auto-check when the user explicitly selected a subset of parts in Bazis
+                SendMessageW(hwnd_chk_selected, BM_SETCHECK, 1, 0);
+            }
+
+            let hwnd_start = mk(&btn_cls, "Start Export", BS_DEFPUSHBUTTON as u32, 410, 140, 114, 34, ID_BTN_START);
+            let hwnd_stop = mk(&btn_cls, "Stop", BS_PUSHBUTTON as u32, 534, 140, 94, 34, ID_BTN_STOP);
             EnableWindow(hwnd_stop, 0);
 
             let hwnd_progress = CreateWindowExW(
@@ -706,7 +855,7 @@ mod win_gui {
                 null(),
                 WS_CHILD | WS_VISIBLE,
                 sc(16),
-                sc(180),
+                sc(232),
                 sc(612),
                 sc(22),
                 hwnd,
@@ -719,18 +868,18 @@ mod win_gui {
                 "Elapsed: 00:00  |  Speed: -- parts/min, -- ops/min  |  ETA: --:--",
                 0,
                 16,
-                210,
+                262,
                 612,
                 20,
                 0,
             );
-            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 234, 612, 20, 0);
+            let hwnd_status = mk(&static_cls, "Ready. Keep TopSolid'Wood 6.25 open.", 0, 16, 286, 612, 20, 0);
             let hwnd_log = mk(
                 &edit_cls,
                 "",
                 WS_BORDER | WS_VSCROLL | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
                 16,
-                260,
+                312,
                 612,
                 232,
                 0,
@@ -744,6 +893,8 @@ mod win_gui {
                 hwnd_chk_save,
                 hwnd_chk_lock,
                 hwnd_chk_hw,
+                hwnd_chk_edges,
+                hwnd_chk_selected,
                 hwnd_progress,
                 hwnd_metrics,
                 hwnd_status,

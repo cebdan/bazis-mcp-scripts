@@ -1103,6 +1103,7 @@ pub fn run_export<F>(
     mode: ExportMode,
     auto_save: bool,
     include_hardware: bool,
+    include_edges: bool,
     cancel: &AtomicBool,
     mut on_progress: F,
 ) -> Result<ExportStats, String>
@@ -1111,11 +1112,12 @@ where
 {
     let t_total = Instant::now();
     init_log(&format!(
-        "Model='{}' | Mode={:?} | AutoSave={} | IncludeHardware={} | Panels={} | Cuts={} | Holes={} | Hardware={}",
+        "Model='{}' | Mode={:?} | AutoSave={} | IncludeHardware={} | IncludeEdges={} | Panels={} | Cuts={} | Holes={} | Hardware={}",
         model.model_name,
         mode,
         auto_save,
         include_hardware,
+        include_edges,
         model.panels.len(),
         model.total_cuts(),
         model.total_holes(),
@@ -1388,20 +1390,27 @@ where
         );
 
         let blk_res = if p.is_rect || p.outer_loop.is_none() {
+            let use_c = if !include_edges {
+                p.nominal_center.as_ref().unwrap_or(&p.center)
+            } else {
+                &p.center
+            };
+            let use_lx = if !include_edges && p.nominal_lx > 1e-4 { p.nominal_lx } else { p.lx };
+            let use_ly = if !include_edges && p.nominal_ly > 1e-4 { p.nominal_ly } else { p.ly };
             shapes.call_obj(
                 "AddBasicBlock",
                 &[
-                    ComArg::F64(p.center.x),
-                    ComArg::F64(p.center.y),
-                    ComArg::F64(p.center.z),
+                    ComArg::F64(use_c.x),
+                    ComArg::F64(use_c.y),
+                    ComArg::F64(use_c.z),
                     ComArg::F64(p.ax_x.x),
                     ComArg::F64(p.ax_x.y),
                     ComArg::F64(p.ax_x.z),
                     ComArg::F64(p.ax_y.x),
                     ComArg::F64(p.ax_y.y),
                     ComArg::F64(p.ax_y.z),
-                    ComArg::F64(p.lx),
-                    ComArg::F64(p.ly),
+                    ComArg::F64(use_lx),
+                    ComArg::F64(use_ly),
                     ComArg::F64(p.lz),
                 ],
             )
@@ -1496,7 +1505,7 @@ where
         }
 
         // Edge banding strips (3D extruded strips for straight & arc edges + ClipPanel trim for shaped panels)
-        if !p.edges.is_empty() {
+        if include_edges && !p.edges.is_empty() {
             let mut edges_built = 0usize;
             for (ei, e) in p.edges.iter().enumerate() {
                 let sloop = match &e.strip_loop {

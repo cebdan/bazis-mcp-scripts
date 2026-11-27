@@ -93,16 +93,17 @@ function pickLayer(panelName, thickness) {
     return 1; // Carcass
 }
 
-function collectPanels(container, out) {
+function collectPanels(container, out, parentSelected) {
     for (var i = 0; i < container.Count; i++) {
         var obj = container.Objects[i];
         if (!obj || obj.Visible === false) continue;
         // Skip TCSGOperation subtrees — their operand panels belong to the boolean body
         if (typeof obj.CSGFunction === "number") continue;
+        var isSel = !!(parentSelected || obj.Selected);
         if (obj.AsPanel) {
-            out.push(obj.AsPanel);
+            out.push({ panel: obj.AsPanel, selected: isSel });
         } else if (obj.Count > 0) {
-            collectPanels(obj, out);
+            collectPanels(obj, out, isSel);
         }
     }
 }
@@ -466,12 +467,47 @@ function classifyCut(cutName, gx1, gx2, gy1, gy2, cMin, cMax, profW) {
     return "groove";
 }
 
+var __cachedExportConfig = null;
+function loadExportConfig() {
+    if (__cachedExportConfig !== null) return __cachedExportConfig;
+    __cachedExportConfig = {};
+    var cfgPaths = [];
+    try { cfgPaths.push(path.join(__dirname, "bazis_export_config.json")); } catch (e) {}
+    cfgPaths.push("Y:\\Works\\bazis\\Scripts\\bazis_export_config.json");
+    for (var i = 0; i < cfgPaths.length; i++) {
+        try {
+            if (fs.existsSync(cfgPaths[i])) {
+                __cachedExportConfig = JSON.parse(fs.readFileSync(cfgPaths[i], "utf8")) || {};
+                break;
+            }
+        } catch (e) {}
+    }
+    return __cachedExportConfig;
+}
+
+function resolveProjectsDir() {
+    var cfg = loadExportConfig();
+    if (cfg && cfg.projectsDir && String(cfg.projectsDir).trim()) {
+        return String(cfg.projectsDir).trim();
+    }
+    try {
+        var rel = path.resolve(__dirname, "..", "Projects");
+        if (fs.existsSync(rel)) return rel;
+    } catch (e) {}
+    return "Y:\\Works\\bazis\\Projects";
+}
+
 function resolveTemplatesDir() {
-    var candidates = [
+    var cfg = loadExportConfig();
+    var candidates = [];
+    if (cfg && cfg.templatesDir && String(cfg.templatesDir).trim()) {
+        candidates.push(String(cfg.templatesDir).trim());
+    }
+    candidates.push(
         path.resolve(__dirname, "..", "TopSolid_Templates"),
         "Y:\\Works\\bazis\\TopSolid_Templates",
         "C:\\Users\\danch\\Documents\\Bazis\\TopSolid_Templates"
-    ];
+    );
     for (var i = 0; i < candidates.length; i++) {
         try { if (fs.existsSync(candidates[i])) return candidates[i]; } catch (e) {}
     }
@@ -479,6 +515,10 @@ function resolveTemplatesDir() {
 }
 
 function resolveHardwareLibDir() {
+    var cfg = loadExportConfig();
+    if (cfg && cfg.hardwareLibDir && String(cfg.hardwareLibDir).trim()) {
+        return String(cfg.hardwareLibDir).trim();
+    }
     try {
         var rel = path.resolve(__dirname, "..", "TopSolid_Lib_Bazis");
         if (fs.existsSync(path.resolve(__dirname, ".."))) return rel;
@@ -603,7 +643,7 @@ function extractHardwareTransformAndBox(obj) {
     };
 }
 
-function collectHardware(container, panelUidToTsName, out) {
+function collectHardware(container, panelUidToTsName, out, parentSelected) {
     var cnt = 0;
     try { cnt = container.Count || 0; } catch (e) { cnt = 0; }
     for (var i = 0; i < cnt; i++) {
@@ -612,6 +652,7 @@ function collectHardware(container, panelUidToTsName, out) {
         if (obj.AsPanel) continue;
         if (typeof obj.CSGFunction === "number") continue;
 
+        var isSel = !!(parentSelected || obj.Selected);
         var isFastener = false;
         try { isFastener = !!(obj.Holes && obj.Holes.Count >= 0); } catch (e) { isFastener = false; }
 
@@ -628,7 +669,7 @@ function collectHardware(container, panelUidToTsName, out) {
             // recurse into it so we pick up the real named fragment block inside!
             if (!name || name === "Model") {
                 if (childCount > 0) {
-                    collectHardware(obj, panelUidToTsName, out);
+                    collectHardware(obj, panelUidToTsName, out, isSel);
                 }
                 continue;
             }
@@ -646,6 +687,7 @@ function collectHardware(container, panelUidToTsName, out) {
                 article: art,
                 supplier: inferSupplier(name),
                 shapeKind: inferHardwareShape(name),
+                selected: isSel,
                 origin: tf.origin,
                 axX: tf.axX,
                 axY: tf.axY,
@@ -659,7 +701,7 @@ function collectHardware(container, panelUidToTsName, out) {
         }
 
         if (childCount > 0) {
-            collectHardware(obj, panelUidToTsName, out);
+            collectHardware(obj, panelUidToTsName, out, isSel);
         }
     }
 }
@@ -679,7 +721,7 @@ function findTemplates(dir) {
     return found;
 }
 
-function extractPanelData(panel, idx) {
+function extractPanelData(panel, idx, isSelected) {
     var cMin = panel.Contour.Min;
     var cMax = panel.Contour.Max;
     var lx = cMax.x - cMin.x;
@@ -910,6 +952,7 @@ function extractPanelData(panel, idx) {
         name: title,
         artPos: artPos,
         material: matName,
+        selected: !!(isSelected || panel.Selected),
         thicknessMm: Math.round(lz * 10) / 10,
         edgesSummary: summarizeEdges(panel),
         edgeCount: edgesInfo.edges.length,
@@ -920,11 +963,14 @@ function extractPanelData(panel, idx) {
         outerLoop: (loops && loops.length > 0) ? loops[0] : null,
         innerLoops: innerLoops,
         center: boardCenter,
+        nominalCenter: center,
         axX: axX,
         axY: blockAxY,
         axZ: axZ,
         lx: boardLx * MM_TO_M,
         ly: boardLy * MM_TO_M,
+        nominalLx: lx * MM_TO_M,
+        nominalLy: ly * MM_TO_M,
         lz: lz * MM_TO_M,
         cuts: cuts,
         holes: holes
@@ -1491,13 +1537,14 @@ function extractBody3D(obj, idxHint) {
     return null;
 }
 
-function collectBodies(container, out) {
+function collectBodies(container, out, parentSelected) {
     var cnt = 0;
     try { cnt = container.Count || 0; } catch (e) { cnt = 0; }
     for (var i = 0; i < cnt; i++) {
         var obj = container.Objects[i];
         if (!obj || obj.Visible === false || obj.AsPanel) continue;
 
+        var isSel = !!(parentSelected || obj.Selected);
         var isFastener = false;
         try { isFastener = !!(obj.Holes && obj.Holes.Count >= 0); } catch (e) {}
         if (isFastener) continue;
@@ -1505,7 +1552,10 @@ function collectBodies(container, out) {
         // Check TCSGOperation FIRST (it has Count > 0, so handle it before generic container recursion)
         if (typeof obj.CSGFunction === "number") {
             var csgBody = extractBody3D(obj, out.length + 1);
-            if (csgBody) out.push(csgBody);
+            if (csgBody) {
+                csgBody.selected = isSel;
+                out.push(csgBody);
+            }
             continue;
         }
 
@@ -1513,13 +1563,16 @@ function collectBodies(container, out) {
         try { childCount = obj.Count || 0; } catch (e) {}
         if (childCount > 0) {
             if (subtreeHasPanel(obj)) {
-                collectBodies(obj, out);
+                collectBodies(obj, out, isSel);
             }
             continue;
         }
 
         var b = extractBody3D(obj, out.length + 1);
-        if (b) out.push(b);
+        if (b) {
+            b.selected = isSel;
+            out.push(b);
+        }
     }
 }
 
@@ -1748,9 +1801,9 @@ function collectModelMaterials(rawPanels, bodies, matLib) {
 
 function main() {
     var rawPanels = [];
-    collectPanels(Model, rawPanels);
+    collectPanels(Model, rawPanels, false);
     var bodies = [];
-    collectBodies(Model, bodies);
+    collectBodies(Model, bodies, false);
     if (rawPanels.length === 0 && bodies.length === 0) {
         alert("No panels or 3D bodies found in the active Bazis model.");
         return;
@@ -1759,24 +1812,26 @@ function main() {
     var tplDir = resolveTemplatesDir();
     var hwLibDir = resolveHardwareLibDir();
     var matLib = loadBazisMaterialLibrary();
-    var materials = collectModelMaterials(rawPanels, bodies, matLib);
+    var rawPanelObjs = [];
+    for (var ri = 0; ri < rawPanels.length; ri++) rawPanelObjs.push(rawPanels[ri].panel);
+    var materials = collectModelMaterials(rawPanelObjs, bodies, matLib);
     var panels = [];
     var panelUidToTsName = {};
     var totalCuts = 0, totalHoles = 0;
     for (var i = 0; i < rawPanels.length; i++) {
-        var pd = extractPanelData(rawPanels[i], i + 1);
+        var pd = extractPanelData(rawPanels[i].panel, i + 1, rawPanels[i].selected);
         panels.push(pd);
-        try { panelUidToTsName[rawPanels[i].UID] = "P" + (i + 1); } catch (e) {}
+        try { panelUidToTsName[rawPanels[i].panel.UID] = "P" + (i + 1); } catch (e) {}
         totalCuts += pd.cuts.length;
         totalHoles += pd.holes.length;
     }
 
     var hardware = [];
-    collectHardware(Model, panelUidToTsName, hardware);
+    collectHardware(Model, panelUidToTsName, hardware, false);
 
     var modelName = (Article && Article.Name) ? String(Article.Name) : "BazisModel";
     var safeModel = modelName.replace(/[^A-Za-z0-9_\-]/g, "_") || "BazisModel";
-    var saveTopPath = "Y:\\Works\\bazis\\Projects\\" + safeModel + ".top";
+    var saveTopPath = path.join(resolveProjectsDir(), safeModel + ".top");
 
     // Preferred path: hand off JSON asynchronously to native Rust app (Bazis never freezes!)
     var rustExe = resolveRustExe();

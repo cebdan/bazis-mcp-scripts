@@ -94,6 +94,8 @@ pub struct PanelData {
     pub name: String,
     pub art_pos: String,
     pub material: String,
+    #[serde(default)]
+    pub selected: bool,
     pub thickness_mm: f64,
     pub edges_summary: String,
     pub edge_count: i32,
@@ -107,11 +109,17 @@ pub struct PanelData {
     #[serde(default)]
     pub inner_loops: Vec<ContourLoop>,
     pub center: Vec3,
+    #[serde(default)]
+    pub nominal_center: Option<Vec3>,
     pub ax_x: Vec3,
     pub ax_y: Vec3,
     pub ax_z: Vec3,
     pub lx: f64,
     pub ly: f64,
+    #[serde(default)]
+    pub nominal_lx: f64,
+    #[serde(default)]
+    pub nominal_ly: f64,
     pub lz: f64,
     #[serde(default)]
     pub cuts: Vec<CutOp>,
@@ -130,6 +138,8 @@ pub struct HardwareItem {
     pub supplier: String,
     #[serde(default)]
     pub shape_kind: String, // "box" | "cylinder"
+    #[serde(default)]
+    pub selected: bool,
     pub origin: Vec3,
     pub ax_x: Vec3,
     pub ax_y: Vec3,
@@ -179,6 +189,8 @@ pub struct Body3D {
     pub name: String,
     #[serde(default)]
     pub material: String,
+    #[serde(default)]
+    pub selected: bool,
     #[serde(default)]
     pub outer_loop: Option<ContourLoop>,
     #[serde(default)]
@@ -281,5 +293,20 @@ impl BazisExportModel {
 
     pub fn total_holes(&self) -> usize {
         self.panels.iter().map(|p| p.holes.len()).sum()
+    }
+
+    pub fn selected_counts(&self) -> (usize, usize, usize) {
+        let sp = self.panels.iter().filter(|p| p.selected).count();
+        let sb = self.bodies.iter().filter(|b| b.selected).count();
+        let sh = self.hardware.iter().filter(|h| h.selected).count();
+        (sp, sb, sh)
+    }
+
+    pub fn filter_selected(&self) -> BazisExportModel {
+        let mut out = self.clone();
+        out.panels.retain(|p| p.selected);
+        out.bodies.retain(|b| b.selected);
+        out.hardware.retain(|h| h.selected);
+        out
     }
 }
