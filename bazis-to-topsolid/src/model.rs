@@ -62,6 +62,33 @@ pub struct HoleOp {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct EdgeBandData {
+    pub elem_index: i32,
+    #[serde(default)]
+    pub side_tag: String, // "L1" | "L2" | "W1" | "W2" | "ARC_E..." | "E..."
+    pub material: String,
+    #[serde(default)]
+    pub code: String,
+    pub thickness_mm: f64,
+    #[serde(default)]
+    pub width_mm: f64,
+    #[serde(default)]
+    pub length_mm: f64,
+    #[serde(default)]
+    pub overhung_mm: f64,
+    #[serde(default)]
+    pub clip_panel: bool,
+    #[serde(default)]
+    pub sign: String,
+    #[serde(default = "default_vec3_zero")]
+    pub mid_point: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub out_normal: Vec3,
+    pub strip_loop: Option<ContourLoop>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PanelData {
     pub uid_name: String,
     pub name: String,
@@ -70,6 +97,10 @@ pub struct PanelData {
     pub thickness_mm: f64,
     pub edges_summary: String,
     pub edge_count: i32,
+    #[serde(default)]
+    pub edge_total_len_mm: f64,
+    #[serde(default)]
+    pub edges: Vec<EdgeBandData>,
     pub layer: i32,
     pub is_rect: bool,
     pub outer_loop: Option<ContourLoop>,
@@ -188,6 +219,44 @@ pub struct Body3D {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MaterialDef {
+    pub name: String,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub category: String, // "panel" | "edge" | "other"
+    #[serde(default)]
+    pub thickness_mm: f64,
+    #[serde(default)]
+    pub width_mm: f64,
+    #[serde(default)]
+    pub length_mm: f64,
+    #[serde(default)]
+    pub density: f64,
+    #[serde(default = "default_color_comp")]
+    pub color_r: f64,
+    #[serde(default = "default_color_comp")]
+    pub color_g: f64,
+    #[serde(default = "default_color_comp")]
+    pub color_b: f64,
+    #[serde(default)]
+    pub reflection: f64,
+    #[serde(default)]
+    pub transparency: f64,
+    #[serde(default)]
+    pub texture_path: String,
+    #[serde(default)]
+    pub texture_name: String,
+    #[serde(default)]
+    pub has_grain: bool,
+}
+
+fn default_color_comp() -> f64 {
+    0.85
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BazisExportModel {
     pub model_name: String,
     #[serde(default)]
@@ -201,6 +270,8 @@ pub struct BazisExportModel {
     pub bodies: Vec<Body3D>,
     #[serde(default)]
     pub hardware: Vec<HardwareItem>,
+    #[serde(default)]
+    pub materials: Vec<MaterialDef>,
 }
 
 impl BazisExportModel {

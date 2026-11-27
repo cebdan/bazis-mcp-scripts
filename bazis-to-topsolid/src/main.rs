@@ -8,6 +8,8 @@ mod diag_log;
 #[cfg(windows)]
 mod exporter;
 #[cfg(windows)]
+mod materials;
+#[cfg(windows)]
 mod win_ui;
 
 use std::env;

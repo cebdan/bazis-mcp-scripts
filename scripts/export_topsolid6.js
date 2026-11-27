@@ -263,6 +263,197 @@ function summarizeEdges(panel) {
     return parts.join("; ");
 }
 
+function pointInContour2D(contour, x, y) {
+    try {
+        if (typeof contour.IsPointInside === "function") {
+            return !!contour.IsPointInside(NewPoint(x, y));
+        }
+    } catch (e) {}
+    var cMin = contour.Min, cMax = contour.Max;
+    return (x > cMin.x + 1e-4 && x < cMax.x - 1e-4 && y > cMin.y + 1e-4 && y < cMax.y - 1e-4);
+}
+
+function extractEdgesData(panel, cMin, cMax, lz, isRect) {
+    var edges = [];
+    var trim = { left: 0, right: 0, bottom: 0, top: 0 };
+    if (!panel.Butts || panel.Butts.Count === 0 || !panel.Contour) {
+        return { edges: edges, trim: trim, totalLenMm: 0 };
+    }
+    var cnt = panel.Contour.Count;
+    var objs = panel.Contour.Objects;
+    var totalLenMm = 0;
+
+    for (var i = 0; i < panel.Butts.Count; i++) {
+        var b = panel.Butts[i];
+        if (!b) continue;
+        var ei = b.ElemIndex;
+        if (typeof ei !== "number" || ei < 0 || ei >= cnt) continue;
+        var el = objs[ei];
+        if (!el) continue;
+
+        var sp = splitBazisMatName(b.Material || "");
+        var matName = sp.name || "Edge";
+        var code = sp.code || "";
+        var thk = Number(b.Thickness) || 0;
+        if (thk < 0.1) thk = 1.0;
+        var wid = Number(b.Width) || (lz + 1.0);
+        var clipPanel = !!b.ClipPanel;
+        var sign = b.Sign ? String(b.Sign).trim() : "";
+        var overhung = Number(b.Overhung) || 0;
+
+        var stripSegs = null;
+        var midPtTs = null;
+        var outNormTs = null;
+        var lenMm = 0;
+        var sideTag = "E" + ei;
+
+        if (el.ElType === 1) {
+            // Straight line edge
+            var p1 = el.Pos1, p2 = el.Pos2;
+            var dx = p2.x - p1.x, dy = p2.y - p1.y;
+            lenMm = Math.sqrt(dx * dx + dy * dy);
+            if (lenMm < 0.5) continue;
+            var tx = dx / lenMm, ty = dy / lenMm;
+            // Two candidate normals in panel local XY
+            var n1x = -ty, n1y = tx;
+            var mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+            var eps = Math.min(1.0, Math.max(0.2, lenMm * 0.05));
+            var in1 = pointInContour2D(panel.Contour, mx + n1x * eps, my + n1y * eps);
+            var in2 = pointInContour2D(panel.Contour, mx - n1x * eps, my - n1y * eps);
+            var nx, ny;
+            if (in1 && !in2) { nx = -n1x; ny = -n1y; }
+            else if (in2 && !in1) { nx = n1x; ny = n1y; }
+            else {
+                // Fallback: away from contour center
+                var cx = (cMin.x + cMax.x) / 2, cy = (cMin.y + cMax.y) / 2;
+                var dot = (mx - cx) * n1x + (my - cy) * n1y;
+                nx = dot >= 0 ? n1x : -n1x;
+                ny = dot >= 0 ? n1y : -n1y;
+            }
+
+            // Classify side for rectangular panels (L1/L2 along X, W1/W2 along Y)
+            if (isRect) {
+                if (Math.abs(nx) > 0.7) {
+                    if (nx < 0) {
+                        sideTag = "W1";
+                        if (clipPanel) trim.left = Math.max(trim.left, thk);
+                    } else {
+                        sideTag = "W2";
+                        if (clipPanel) trim.right = Math.max(trim.right, thk);
+                    }
+                } else if (Math.abs(ny) > 0.7) {
+                    if (ny < 0) {
+                        sideTag = "L1";
+                        if (clipPanel) trim.bottom = Math.max(trim.bottom, thk);
+                    } else {
+                        sideTag = "L2";
+                        if (clipPanel) trim.top = Math.max(trim.top, thk);
+                    }
+                }
+            }
+
+            // Build closed 4-segment strip loop at Z=0
+            // If clipPanel=true: outer face is ON (p1..p2), inner face is at (p - n*thk)
+            // If clipPanel=false: inner face is ON (p1..p2), outer face is at (p + n*thk)
+            var a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y;
+            if (clipPanel) {
+                a1x = p1.x - nx * thk; a1y = p1.y - ny * thk;
+                a2x = p2.x - nx * thk; a2y = p2.y - ny * thk;
+                b1x = p1.x; b1y = p1.y;
+                b2x = p2.x; b2y = p2.y;
+            } else {
+                a1x = p1.x; a1y = p1.y;
+                a2x = p2.x; a2y = p2.y;
+                b1x = p1.x + nx * thk; b1y = p1.y + ny * thk;
+                b2x = p2.x + nx * thk; b2y = p2.y + ny * thk;
+            }
+
+            var gpA1 = toTsPt(panel.ToGlobal(NewVector(a1x, a1y, 0)));
+            var gpA2 = toTsPt(panel.ToGlobal(NewVector(a2x, a2y, 0)));
+            var gpB2 = toTsPt(panel.ToGlobal(NewVector(b2x, b2y, 0)));
+            var gpB1 = toTsPt(panel.ToGlobal(NewVector(b1x, b1y, 0)));
+            stripSegs = [
+                { kind: "line", p1: gpA1, p2: gpA2 },
+                { kind: "line", p1: gpA2, p2: gpB2 },
+                { kind: "line", p1: gpB2, p2: gpB1 },
+                { kind: "line", p1: gpB1, p2: gpA1 }
+            ];
+            midPtTs = toTsPt(panel.ToGlobal(NewVector(mx, my, lz / 2)));
+            var p0g = panel.ToGlobal(NewVector(0, 0, 0));
+            outNormTs = toTsDir(vSub(panel.ToGlobal(NewVector(nx, ny, 0)), p0g));
+        } else if (el.ElType === 2) {
+            // Curved arc edge (T2DArc)
+            var c = el.Center;
+            var r = el.ArcRadius();
+            var p1a = el.Pos1, p2a = el.Pos2;
+            var pma = el.ArcCenter();
+            var ang = 0;
+            try { ang = Math.abs(el.ArcAngle()); } catch (e) {}
+            if (!ang || ang < 1e-4) {
+                var v1x = p1a.x - c.x, v1y = p1a.y - c.y;
+                var v2x = p2a.x - c.x, v2y = p2a.y - c.y;
+                var dotA = Math.max(-1, Math.min(1, (v1x * v2x + v1y * v2y) / (r * r)));
+                ang = Math.acos(dotA);
+            }
+            lenMm = r * ang;
+            if (r < thk + 0.5 || lenMm < 0.5) continue;
+
+            // Outward radial direction at arc midpoint
+            var rmx = (pma.x - c.x) / r, rmy = (pma.y - c.y) / r;
+            var epsA = Math.min(1.0, r * 0.1);
+            var outSign = pointInContour2D(panel.Contour, pma.x + rmx * epsA, pma.y + rmy * epsA) ? -1 : 1;
+            // Offset radius for the second arc
+            var rOff = clipPanel ? (r - outSign * thk) : (r + outSign * thk);
+            if (rOff < 0.5) continue;
+            var scale = rOff / r;
+            var q1x = c.x + (p1a.x - c.x) * scale, q1y = c.y + (p1a.y - c.y) * scale;
+            var qmx = c.x + (pma.x - c.x) * scale, qmy = c.y + (pma.y - c.y) * scale;
+            var q2x = c.x + (p2a.x - c.x) * scale, q2y = c.y + (p2a.y - c.y) * scale;
+
+            var gP1 = toTsPt(panel.ToGlobal(NewVector(p1a.x, p1a.y, 0)));
+            var gPm = toTsPt(panel.ToGlobal(NewVector(pma.x, pma.y, 0)));
+            var gP2 = toTsPt(panel.ToGlobal(NewVector(p2a.x, p2a.y, 0)));
+            var gQ2 = toTsPt(panel.ToGlobal(NewVector(q2x, q2y, 0)));
+            var gQm = toTsPt(panel.ToGlobal(NewVector(qmx, qmy, 0)));
+            var gQ1 = toTsPt(panel.ToGlobal(NewVector(q1x, q1y, 0)));
+            stripSegs = [
+                { kind: "arc", p1: gP1, pm: gPm, p2: gP2 },
+                { kind: "line", p1: gP2, p2: gQ2 },
+                { kind: "arc", p1: gQ2, pm: gQm, p2: gQ1 },
+                { kind: "line", p1: gQ1, p2: gP1 }
+            ];
+            midPtTs = toTsPt(panel.ToGlobal(NewVector(pma.x, pma.y, lz / 2)));
+            var p0gA = panel.ToGlobal(NewVector(0, 0, 0));
+            outNormTs = toTsDir(vSub(panel.ToGlobal(NewVector(rmx * outSign, rmy * outSign, 0)), p0gA));
+            sideTag = "ARC_E" + ei;
+        }
+
+        if (!stripSegs) continue;
+        totalLenMm += lenMm;
+        edges.push({
+            elemIndex: ei,
+            sideTag: sideTag,
+            material: matName,
+            code: code,
+            thicknessMm: Math.round(thk * 100) / 100,
+            widthMm: Math.round(wid * 10) / 10,
+            lengthMm: Math.round(lenMm * 10) / 10,
+            overhungMm: Math.round(overhung * 10) / 10,
+            clipPanel: clipPanel,
+            sign: sign,
+            midPoint: midPtTs,
+            outNormal: outNormTs,
+            stripLoop: { segs: stripSegs }
+        });
+    }
+
+    return {
+        edges: edges,
+        trim: trim,
+        totalLenMm: Math.round(totalLenMm * 10) / 10
+    };
+}
+
 function classifyCut(cutName, gx1, gx2, gy1, gy2, cMin, cMax, profW) {
     var low = String(cutName || "").toLowerCase();
     if (low.indexOf("pocket") >= 0 || low.indexOf("shaker") >= 0) return "pocket";
@@ -693,6 +884,22 @@ function extractPanelData(panel, idx) {
         }
     }
 
+    var edgesInfo = extractEdgesData(panel, cMin, cMax, lz, isRect);
+    var boardLx = lx;
+    var boardLy = ly;
+    var boardCenter = center;
+    if (isRect && (edgesInfo.trim.left > 0 || edgesInfo.trim.right > 0 || edgesInfo.trim.bottom > 0 || edgesInfo.trim.top > 0)) {
+        var bMinX = cMin.x + edgesInfo.trim.left;
+        var bMaxX = cMax.x - edgesInfo.trim.right;
+        var bMinY = cMin.y + edgesInfo.trim.bottom;
+        var bMaxY = cMax.y - edgesInfo.trim.top;
+        if (bMaxX - bMinX > 1.0 && bMaxY - bMinY > 1.0) {
+            boardLx = bMaxX - bMinX;
+            boardLy = bMaxY - bMinY;
+            boardCenter = toTsPt(panel.ToGlobal(NewVector((bMinX + bMaxX) / 2, (bMinY + bMaxY) / 2, lz / 2)));
+        }
+    }
+
     var artPos = panel.ArtPos ? String(panel.ArtPos).trim() : "";
     var matName = panel.MaterialName ? String(panel.MaterialName).split("\r")[0].trim() : "";
     var rawName = panel.Name || ("Panel_" + idx);
@@ -705,17 +912,19 @@ function extractPanelData(panel, idx) {
         material: matName,
         thicknessMm: Math.round(lz * 10) / 10,
         edgesSummary: summarizeEdges(panel),
-        edgeCount: panel.Butts ? panel.Butts.Count : 0,
+        edgeCount: edgesInfo.edges.length,
+        edgeTotalLenMm: edgesInfo.totalLenMm,
+        edges: edgesInfo.edges,
         layer: pickLayer(rawName, lz),
         isRect: isRect,
         outerLoop: (loops && loops.length > 0) ? loops[0] : null,
         innerLoops: innerLoops,
-        center: center,
+        center: boardCenter,
         axX: axX,
         axY: blockAxY,
         axZ: axZ,
-        lx: lx * MM_TO_M,
-        ly: ly * MM_TO_M,
+        lx: boardLx * MM_TO_M,
+        ly: boardLy * MM_TO_M,
         lz: lz * MM_TO_M,
         cuts: cuts,
         holes: holes
@@ -1314,6 +1523,229 @@ function collectBodies(container, out) {
     }
 }
 
+function decodeXmlEntities(s) {
+    return String(s || "")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, "\"")
+        .replace(/&apos;/g, "'");
+}
+
+function splitBazisMatName(rawName) {
+    var s = String(rawName || "");
+    var parts = s.split(/[\r\n]+/);
+    var name = (parts[0] || "").trim();
+    var code = parts.length > 1 ? (parts[1] || "").trim() : "";
+    return { name: name, code: code };
+}
+
+function colorRefToRgb(col) {
+    var n = Number(col);
+    if (!isFinite(n) || n < 0) return { r: 0.85, g: 0.85, b: 0.85 };
+    var iv = Math.floor(n) & 0xFFFFFF;
+    var r = (iv & 0xFF) / 255.0;
+    var g = ((iv >> 8) & 0xFF) / 255.0;
+    var b = ((iv >> 16) & 0xFF) / 255.0;
+    return { r: r, g: g, b: b };
+}
+
+function resolveBazisTextureRoots() {
+    var roots = [];
+    var appData = process.env.APPDATA || "";
+    var userProf = process.env.USERPROFILE || "";
+    var settingsPaths = [];
+    if (appData) settingsPaths.push(path.join(appData, "Bazis", "Settings.xml"));
+    settingsPaths.push("Y:\\Works\\bazis\\Settings\\Settings.xml");
+
+    for (var i = 0; i < settingsPaths.length; i++) {
+        try {
+            if (!fs.existsSync(settingsPaths[i])) continue;
+            var xml = fs.readFileSync(settingsPaths[i], "utf8");
+            var m = xml.match(/<PathTEXTUR>([^<]+)<\/PathTEXTUR>/i);
+            if (m && m[1]) {
+                var p = decodeXmlEntities(m[1]).trim().replace(/\{\{BAZIS_DIR\}\}/g, "Y:\\Works\\bazis");
+                if (p && roots.indexOf(p) === -1) roots.push(p);
+            }
+        } catch (e) {}
+    }
+    var fallbacks = [
+        "Y:\\Works\\bazis\\Textures",
+        "Y:\\Works\\bazis",
+        userProf ? path.join(userProf, "Documents", "Bazis", "Textures") : "",
+        userProf ? path.join(userProf, "Documents", "Bazis") : ""
+    ];
+    for (var j = 0; j < fallbacks.length; j++) {
+        if (fallbacks[j] && roots.indexOf(fallbacks[j]) === -1) roots.push(fallbacks[j]);
+    }
+    return roots;
+}
+
+function resolveTextureFile(relOrAbs, texRoots) {
+    var raw = String(relOrAbs || "").trim();
+    if (!raw) return "";
+    try {
+        if (fs.existsSync(raw)) return raw;
+    } catch (e) {}
+    for (var i = 0; i < texRoots.length; i++) {
+        var cand = path.join(texRoots[i], raw);
+        try {
+            if (fs.existsSync(cand)) return cand;
+        } catch (e) {}
+    }
+    return "";
+}
+
+function loadBazisMaterialLibrary() {
+    var map = {};
+    var texRoots = resolveBazisTextureRoots();
+    var appData = process.env.APPDATA || "";
+    var xmlPaths = [];
+    if (appData) xmlPaths.push(path.join(appData, "Bazis", "Materials.xml"));
+    xmlPaths.push("Y:\\Works\\bazis\\Settings\\Materials.xml");
+
+    for (var i = 0; i < xmlPaths.length; i++) {
+        try {
+            if (!fs.existsSync(xmlPaths[i])) continue;
+            var xml = fs.readFileSync(xmlPaths[i], "utf8");
+            var re = /<Material>([\s\S]*?)<\/Material>/g;
+            var m;
+            while ((m = re.exec(xml)) !== null) {
+                var blk = m[1];
+                var nmM = blk.match(/<Name>([\s\S]*?)<\/Name>/i);
+                if (!nmM) continue;
+                var sp = splitBazisMatName(decodeXmlEntities(nmM[1]));
+                if (!sp.name) continue;
+                var key = sp.name.toLowerCase();
+                var colM = blk.match(/<Color>([^<]+)<\/Color>/i);
+                var texM = blk.match(/<Texture>([^<]+)<\/Texture>/i);
+                var reflM = blk.match(/<Reflection>([^<]+)<\/Reflection>/i);
+                var transM = blk.match(/<Transparency>([^<]+)<\/Transparency>/i);
+                var rgb = colM ? colorRefToRgb(colM[1]) : { r: 0.85, g: 0.85, b: 0.85 };
+                var rawTex = texM ? decodeXmlEntities(texM[1]).trim() : "";
+                var texPath = resolveTextureFile(rawTex, texRoots);
+                var texName = rawTex ? path.basename(rawTex).replace(/\.[^.]+$/, "") : "";
+                var existing = map[key];
+                if (!existing || (!existing.texturePath && texPath)) {
+                    map[key] = {
+                        name: sp.name,
+                        code: sp.code || (existing ? existing.code : ""),
+                        colorR: rgb.r,
+                        colorG: rgb.g,
+                        colorB: rgb.b,
+                        reflection: reflM ? (parseFloat(reflM[1]) || 0) : 0,
+                        transparency: transM ? (parseFloat(transM[1]) || 0) : 0,
+                        texturePath: texPath || (existing ? existing.texturePath : ""),
+                        textureName: texName || (existing ? existing.textureName : "")
+                    };
+                }
+            }
+        } catch (e) {}
+    }
+    return map;
+}
+
+function classifyMaterialCategory(name, hintCat) {
+    if (hintCat === "panel" || hintCat === "edge") return hintCat;
+    var low = String(name || "").toLowerCase();
+    if (low.indexOf("edge") !== -1 || low.indexOf("abs") !== -1 || low.indexOf("pvc") !== -1 || low.indexOf("butt") !== -1) {
+        return "edge";
+    }
+    if (low.indexOf("ldsp") !== -1 || low.indexOf("mdf") !== -1 || low.indexOf("hdf") !== -1 || low.indexOf("board") !== -1 || low.indexOf("panel") !== -1 || low.indexOf("plywood") !== -1) {
+        return "panel";
+    }
+    return "other";
+}
+
+function collectModelMaterials(rawPanels, bodies, matLib) {
+    var byKey = {};
+    var out = [];
+
+    function upsert(rawName, hintCat, thicknessMm, widthMm, objColor, hasGrain) {
+        var sp = splitBazisMatName(rawName);
+        if (!sp.name) return;
+        var key = sp.name.toLowerCase();
+        var lib = matLib[key] || null;
+        if (byKey[key]) {
+            if (thicknessMm > 0 && byKey[key].thicknessMm <= 0) byKey[key].thicknessMm = thicknessMm;
+            if (widthMm > 0 && byKey[key].widthMm <= 0) byKey[key].widthMm = widthMm;
+            if (hasGrain) byKey[key].hasGrain = true;
+            return;
+        }
+        var rgb = lib ? { r: lib.colorR, g: lib.colorG, b: lib.colorB } : colorRefToRgb(objColor);
+        var entry = {
+            name: sp.name,
+            code: sp.code || (lib ? lib.code : ""),
+            category: classifyMaterialCategory(sp.name, hintCat),
+            thicknessMm: thicknessMm > 0 ? thicknessMm : 0,
+            widthMm: widthMm > 0 ? widthMm : 0,
+            lengthMm: 0,
+            density: 0,
+            colorR: rgb.r,
+            colorG: rgb.g,
+            colorB: rgb.b,
+            reflection: lib ? lib.reflection : 0,
+            transparency: lib ? lib.transparency : 0,
+            texturePath: lib ? lib.texturePath : "",
+            textureName: lib ? lib.textureName : "",
+            hasGrain: !!hasGrain
+        };
+        byKey[key] = entry;
+        out.push(entry);
+    }
+
+    for (var i = 0; i < rawPanels.length; i++) {
+        var p = rawPanels[i];
+        var pMat = "";
+        try { pMat = cleanMatName(p.MaterialName); } catch (e) {}
+        var pThk = 0;
+        try { pThk = Number(p.Thickness) || 0; } catch (e) {}
+        var pCol = -1;
+        try { pCol = p.Color; } catch (e) {}
+        var pGrain = false;
+        try { pGrain = (p.TextureOrientation !== 0); } catch (e) {}
+        if (pMat) upsert(p.MaterialName || pMat, "panel", pThk, 0, pCol, pGrain);
+
+        try {
+            if (p.Butts && p.Butts.Count > 0) {
+                for (var bi = 0; bi < p.Butts.Count; bi++) {
+                    var bt = p.Butts[bi];
+                    if (!bt) continue;
+                    var bMat = bt.Material || "";
+                    var bThk = Number(bt.Thickness) || 0;
+                    var bWid = Number(bt.Width) || (pThk > 0 ? pThk + 1 : 19);
+                    if (bMat) upsert(bMat, "edge", bThk, bWid, -1, false);
+                }
+            }
+        } catch (e) {}
+
+        try {
+            if (p.Plastics && p.Plastics.Count > 0) {
+                for (var pi = 0; pi < p.Plastics.Count; pi++) {
+                    var pl = p.Plastics[pi];
+                    if (!pl) continue;
+                    var plMat = pl.Material || "";
+                    var plThk = Number(pl.Thickness) || 0;
+                    if (plMat) upsert(plMat, "panel", plThk, 0, -1, false);
+                }
+            }
+        } catch (e) {}
+    }
+
+    function walkBodyMats(list) {
+        if (!list) return;
+        for (var j = 0; j < list.length; j++) {
+            var b = list[j];
+            if (!b) continue;
+            if (b.material) upsert(b.material, "other", 0, 0, -1, false);
+            if (b.operands && b.operands.length > 0) walkBodyMats(b.operands);
+        }
+    }
+    walkBodyMats(bodies);
+
+    return out;
+}
+
 function main() {
     var rawPanels = [];
     collectPanels(Model, rawPanels);
@@ -1326,6 +1758,8 @@ function main() {
 
     var tplDir = resolveTemplatesDir();
     var hwLibDir = resolveHardwareLibDir();
+    var matLib = loadBazisMaterialLibrary();
+    var materials = collectModelMaterials(rawPanels, bodies, matLib);
     var panels = [];
     var panelUidToTsName = {};
     var totalCuts = 0, totalHoles = 0;
@@ -1355,7 +1789,8 @@ function main() {
             saveTopPath: saveTopPath,
             panels: panels,
             bodies: bodies,
-            hardware: hardware
+            hardware: hardware,
+            materials: materials
         };
         fs.writeFileSync(jsonPath, JSON.stringify(payload), "utf8");
         var child = cp.spawn(rustExe, [jsonPath], {

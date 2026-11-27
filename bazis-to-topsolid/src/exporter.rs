@@ -765,6 +765,7 @@ fn build_body_3d(
     let _ = shape.put("Layer", ComArg::I32(0));
     if !b.material.is_empty() {
         let _ = shape.call("SetMatter", &[ComArg::Str(&b.material)]);
+        let _ = shape.call("SetCoating", &[ComArg::Str(&b.material)]);
     }
     Ok(shape)
 }
@@ -1311,6 +1312,11 @@ where
         saved_path: None,
     };
 
+    // Phase 0: Check and append missing Bazis materials & textures into TopSolid'Wood "Bazis" section
+    if !model.materials.is_empty() {
+        let _mat_rep = crate::materials::sync_materials_to_topsolid(&model.materials);
+    }
+
     // Phase 1: Build missing cached exact-size native .top templates
     let t_p1 = Instant::now();
     if !variants.is_empty() {
@@ -1467,8 +1473,137 @@ where
             "SetTextProperty",
             &[ComArg::Str("Bazis_Edges"), ComArg::Str(&p.edges_summary)],
         );
+        if p.edge_total_len_mm > 0.1 {
+            let tl_s = format!("{:.1}mm", p.edge_total_len_mm);
+            let _ = blk.call(
+                "SetTextProperty",
+                &[ComArg::Str("Bazis_Edge_TotalLen"), ComArg::Str(&tl_s)],
+            );
+        }
+        for e in &p.edges {
+            if matches!(e.side_tag.as_str(), "L1" | "L2" | "W1" | "W2") {
+                let prop_name = format!("Bazis_Edge_{}", e.side_tag);
+                let prop_val = format!("{} ({}mm, L={:.0}mm)", e.material, e.thickness_mm, e.length_mm);
+                let _ = blk.call(
+                    "SetTextProperty",
+                    &[ComArg::Str(&prop_name), ComArg::Str(&prop_val)],
+                );
+            }
+        }
         if !p.material.is_empty() {
             let _ = blk.call("SetMatter", &[ComArg::Str(&p.material)]);
+            let _ = blk.call("SetCoating", &[ComArg::Str(&p.material)]);
+        }
+
+        // Edge banding strips (3D extruded strips for straight & arc edges + ClipPanel trim for shaped panels)
+        if !p.edges.is_empty() {
+            let mut edges_built = 0usize;
+            for (ei, e) in p.edges.iter().enumerate() {
+                let sloop = match &e.strip_loop {
+                    Some(l) if !l.segs.is_empty() => l,
+                    _ => continue,
+                };
+                // For shaped panels with ClipPanel=true, subtract the exact edge strip from the board first
+                if !p.is_rect && e.clip_panel {
+                    if let Ok(trim_curve) = build_loop_curve(&curves, sloop, &p.ax_x, &p.ax_y) {
+                        if let Ok(trim_tool) = shapes.call_obj(
+                            "AddBasicExtruded",
+                            &[
+                                ComArg::Obj(&trim_curve),
+                                ComArg::F64(p.ax_z.x),
+                                ComArg::F64(p.ax_z.y),
+                                ComArg::F64(p.ax_z.z),
+                                ComArg::F64(p.lz + 0.002),
+                                ComArg::F64(0.001),
+                                ComArg::F64(0.0),
+                                ComArg::Bool(false),
+                                ComArg::Bool(true),
+                            ],
+                        ) {
+                            if let Ok(ops) = blk.get_obj("Operations") {
+                                let _ = ops.call(
+                                    "AddSubtraction",
+                                    &[
+                                        ComArg::Obj(&trim_tool),
+                                        ComArg::NullDispatch,
+                                        ComArg::Bool(true),
+                                        ComArg::Bool(false),
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                }
+                // Build visible 3D edge band strip solid
+                if let Ok(edge_curve) = build_loop_curve(&curves, sloop, &p.ax_x, &p.ax_y) {
+                    if let Ok(edge_sh) = shapes.call_obj(
+                        "AddBasicExtruded",
+                        &[
+                            ComArg::Obj(&edge_curve),
+                            ComArg::F64(p.ax_z.x),
+                            ComArg::F64(p.ax_z.y),
+                            ComArg::F64(p.ax_z.z),
+                            ComArg::F64(p.lz),
+                            ComArg::F64(0.0),
+                            ComArg::F64(0.0),
+                            ComArg::Bool(false),
+                            ComArg::Bool(true),
+                        ],
+                    ) {
+                        let ename = format!("{}E{}", ts_panel_name, ei + 1);
+                        let edes = format!(
+                            "Edgeband [{}]: {} ({}x{}mm)",
+                            e.side_tag, e.material, e.thickness_mm, e.width_mm
+                        );
+                        let _ = edge_sh.put("Name", ComArg::Str(&ename));
+                        let _ = edge_sh.put("Designation", ComArg::Str(&edes));
+                        if !e.code.is_empty() {
+                            let _ = edge_sh.put("Reference", ComArg::Str(&e.code));
+                        }
+                        let _ = edge_sh.put("Layer", ComArg::I32(0));
+                        let _ = edge_sh.call(
+                            "SetTextProperty",
+                            &[ComArg::Str("Bazis_Edge_Parent"), ComArg::Str(&ts_panel_name)],
+                        );
+                        let _ = edge_sh.call(
+                            "SetTextProperty",
+                            &[ComArg::Str("Bazis_Edge_Side"), ComArg::Str(&e.side_tag)],
+                        );
+                        let elen_s = format!("{:.1}mm", e.length_mm);
+                        let _ = edge_sh.call(
+                            "SetTextProperty",
+                            &[ComArg::Str("Bazis_Edge_Length"), ComArg::Str(&elen_s)],
+                        );
+                        let ethk_s = format!("{}mm", e.thickness_mm);
+                        let _ = edge_sh.call(
+                            "SetTextProperty",
+                            &[ComArg::Str("Bazis_Edge_Thickness"), ComArg::Str(&ethk_s)],
+                        );
+                        let _ = edge_sh.call(
+                            "SetTextProperty",
+                            &[
+                                ComArg::Str("Bazis_Edge_ClipPanel"),
+                                ComArg::Str(if e.clip_panel { "Yes" } else { "No" }),
+                            ],
+                        );
+                        if !e.material.is_empty() {
+                            let _ = edge_sh.call("SetMatter", &[ComArg::Str(&e.material)]);
+                            let _ = edge_sh.call("SetCoating", &[ComArg::Str(&e.material)]);
+                        }
+                        edges_built += 1;
+                    }
+                }
+            }
+            if edges_built > 0 {
+                log_line(&format!(
+                    "  EDGES {} ({}): built={}/{} total_len={:.1}mm",
+                    ts_panel_name,
+                    p.name,
+                    edges_built,
+                    p.edges.len(),
+                    p.edge_total_len_mm
+                ));
+            }
         }
 
         // Internal cutouts (shaped panels)
