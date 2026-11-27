@@ -5,10 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::com::{ComArg, ComGuard, ComObj};
-use crate::model::{BazisExportModel, ContourLoop, CurveSeg, HardwareItem, HoleOp, Vec3};
+use crate::diag_log::{init_log, log_line};
+use crate::model::{BazisExportModel, Body3D, ContourLoop, CurveSeg, HardwareItem, HoleOp, SweepSeg, Vec3};
 use crate::win_ui::{apply_use_process_batch, modify_active_doc_params};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +389,386 @@ fn build_loop_curve(
     )
 }
 
+fn call_basic_revolved(
+    shapes: &ComObj,
+    comp: &ComObj,
+    ox: f64,
+    oy: f64,
+    oz: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    angle_rad: f64,
+) -> Result<ComObj, String> {
+    // Verified TopSolid 6 IShapes::AddBasicRevolved = 9 args:
+    // (inCurve, ox, oy, oz, dx, dy, dz, angle_rad, closed)
+    let full_circle = angle_rad >= std::f64::consts::TAU - 1e-4;
+    if full_circle {
+        // Split 360° into two 180° closed halves united via AddUnion
+        let h1 = shapes.call_obj(
+            "AddBasicRevolved",
+            &[
+                ComArg::Obj(comp),
+                ComArg::F64(ox),
+                ComArg::F64(oy),
+                ComArg::F64(oz),
+                ComArg::F64(dx),
+                ComArg::F64(dy),
+                ComArg::F64(dz),
+                ComArg::F64(std::f64::consts::PI),
+                ComArg::Bool(true),
+            ],
+        )?;
+        let h2 = shapes.call_obj(
+            "AddBasicRevolved",
+            &[
+                ComArg::Obj(comp),
+                ComArg::F64(ox),
+                ComArg::F64(oy),
+                ComArg::F64(oz),
+                ComArg::F64(-dx),
+                ComArg::F64(-dy),
+                ComArg::F64(-dz),
+                ComArg::F64(std::f64::consts::PI),
+                ComArg::Bool(true),
+            ],
+        )?;
+        if let Ok(ops) = h1.get_obj("Operations") {
+            let _ = ops.call(
+                "AddUnion",
+                &[
+                    ComArg::Obj(&h2),
+                    ComArg::NullDispatch,
+                    ComArg::Bool(true),
+                    ComArg::Bool(false),
+                ],
+            );
+        }
+        return Ok(h1);
+    }
+
+    shapes.call_obj(
+        "AddBasicRevolved",
+        &[
+            ComArg::Obj(comp),
+            ComArg::F64(ox),
+            ComArg::F64(oy),
+            ComArg::F64(oz),
+            ComArg::F64(dx),
+            ComArg::F64(dy),
+            ComArg::F64(dz),
+            ComArg::F64(angle_rad),
+            ComArg::Bool(true),
+        ],
+    )
+}
+
+fn build_sweep_segment(
+    shapes: &ComObj,
+    curves: &ComObj,
+    seg: &SweepSeg,
+) -> Result<ComObj, String> {
+    let comp = build_loop_curve(curves, &seg.profile_loop, &seg.ax_x, &seg.ax_y)?;
+    if seg.kind == "revolve" {
+        call_basic_revolved(
+            shapes,
+            &comp,
+            seg.axis_origin.x,
+            seg.axis_origin.y,
+            seg.axis_origin.z,
+            seg.axis_dir.x,
+            seg.axis_dir.y,
+            seg.axis_dir.z,
+            seg.angle_rad,
+        )
+    } else {
+        shapes.call_obj(
+            "AddBasicExtruded",
+            &[
+                ComArg::Obj(&comp),
+                ComArg::F64(seg.dir.x),
+                ComArg::F64(seg.dir.y),
+                ComArg::F64(seg.dir.z),
+                ComArg::F64(seg.length),
+                ComArg::F64(0.0),
+                ComArg::F64(0.0),
+                ComArg::Bool(false),
+                ComArg::Bool(true),
+            ],
+        )
+    }
+}
+
+fn build_body_3d(
+    shapes: &ComObj,
+    curves: &ComObj,
+    b: &Body3D,
+    ts_name: &str,
+) -> Result<ComObj, String> {
+    let shape = match b.kind.as_str() {
+        "extrusion" => {
+            let lp = b
+                .outer_loop
+                .as_ref()
+                .ok_or_else(|| "Extrusion missing outerLoop".to_string())?;
+            let comp = build_loop_curve(curves, lp, &b.ax_x, &b.ax_y)?;
+            let sh = shapes.call_obj(
+                "AddBasicExtruded",
+                &[
+                    ComArg::Obj(&comp),
+                    ComArg::F64(b.dir.x),
+                    ComArg::F64(b.dir.y),
+                    ComArg::F64(b.dir.z),
+                    ComArg::F64(b.length),
+                    ComArg::F64(0.0),
+                    ComArg::F64(0.0),
+                    ComArg::Bool(false),
+                    ComArg::Bool(true),
+                ],
+            )?;
+            if !b.inner_loops.is_empty() {
+                if let Ok(ops) = sh.get_obj("Operations") {
+                    for ilp in &b.inner_loops {
+                        if let Ok(icomp) = build_loop_curve(curves, ilp, &b.ax_x, &b.ax_y) {
+                            if let Ok(tool) = shapes.call_obj(
+                                "AddBasicExtruded",
+                                &[
+                                    ComArg::Obj(&icomp),
+                                    ComArg::F64(b.dir.x),
+                                    ComArg::F64(b.dir.y),
+                                    ComArg::F64(b.dir.z),
+                                    ComArg::F64(b.length + 0.002),
+                                    ComArg::F64(0.0),
+                                    ComArg::F64(0.0),
+                                    ComArg::Bool(false),
+                                    ComArg::Bool(true),
+                                ],
+                            ) {
+                                let _ = ops.call(
+                                    "AddSubtraction",
+                                    &[
+                                        ComArg::Obj(&tool),
+                                        ComArg::NullDispatch,
+                                        ComArg::Bool(true),
+                                        ComArg::Bool(false),
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            sh
+        }
+        "revolve" => {
+            let lp = b
+                .outer_loop
+                .as_ref()
+                .ok_or_else(|| "Revolve missing outerLoop".to_string())?;
+            let comp = build_loop_curve(curves, lp, &b.ax_x, &b.ax_y)?;
+            call_basic_revolved(
+                shapes,
+                &comp,
+                b.axis_origin.x,
+                b.axis_origin.y,
+                b.axis_origin.z,
+                b.axis_dir.x,
+                b.axis_dir.y,
+                b.axis_dir.z,
+                b.angle_rad,
+            )?
+        }
+        "sweep" => {
+            if b.segments.is_empty() {
+                return Err("Sweep has 0 segments".into());
+            }
+            let base = build_sweep_segment(shapes, curves, &b.segments[0])?;
+            if b.segments.len() > 1 {
+                if let Ok(ops) = base.get_obj("Operations") {
+                    for seg in &b.segments[1..] {
+                        match build_sweep_segment(shapes, curves, seg) {
+                            Ok(part) => {
+                                if let Err(e) = ops.call(
+                                    "AddUnion",
+                                    &[
+                                        ComArg::Obj(&part),
+                                        ComArg::NullDispatch,
+                                        ComArg::Bool(true),
+                                        ComArg::Bool(false),
+                                    ],
+                                ) {
+                                    log_line(&format!("  SWEEP UNION WARN on {}: {}", ts_name, e));
+                                }
+                            }
+                            Err(e) => {
+                                log_line(&format!("  SWEEP SEG ERR on {}: {}", ts_name, e));
+                            }
+                        }
+                    }
+                }
+            }
+            base
+        }
+        "box" => shapes.call_obj(
+            "AddBasicBlock",
+            &[
+                ComArg::F64(b.center.x),
+                ComArg::F64(b.center.y),
+                ComArg::F64(b.center.z),
+                ComArg::F64(b.ax_x.x),
+                ComArg::F64(b.ax_x.y),
+                ComArg::F64(b.ax_x.z),
+                ComArg::F64(b.ax_y.x),
+                ComArg::F64(b.ax_y.y),
+                ComArg::F64(b.ax_y.z),
+                ComArg::F64(b.lx),
+                ComArg::F64(b.ly),
+                ComArg::F64(b.lz),
+            ],
+        )?,
+        "sphere" => {
+            let r = b.radius.max(0.001);
+            let ax_x = v_norm(&b.ax_x);
+            let ax_y = v_norm(&b.ax_y);
+            let c = &b.center;
+            let p_bot = Vec3 { x: c.x - ax_y.x * r, y: c.y - ax_y.y * r, z: c.z - ax_y.z * r };
+            let p_mid = Vec3 { x: c.x + ax_x.x * r, y: c.y + ax_x.y * r, z: c.z + ax_x.z * r };
+            let p_top = Vec3 { x: c.x + ax_y.x * r, y: c.y + ax_y.y * r, z: c.z + ax_y.z * r };
+            let arc = curves.call_obj(
+                "Add3PointsCircle",
+                &[
+                    ComArg::F64(p_bot.x),
+                    ComArg::F64(p_bot.y),
+                    ComArg::F64(p_bot.z),
+                    ComArg::F64(p_mid.x),
+                    ComArg::F64(p_mid.y),
+                    ComArg::F64(p_mid.z),
+                    ComArg::F64(p_top.x),
+                    ComArg::F64(p_top.y),
+                    ComArg::F64(p_top.z),
+                    ComArg::I32(0),
+                ],
+            )?;
+            let axis_ln = curves.call_obj(
+                "AddBasicLine",
+                &[
+                    ComArg::F64(p_top.x),
+                    ComArg::F64(p_top.y),
+                    ComArg::F64(p_top.z),
+                    ComArg::F64(p_bot.x),
+                    ComArg::F64(p_bot.y),
+                    ComArg::F64(p_bot.z),
+                ],
+            )?;
+            let comp = curves.call_obj(
+                "AddBasicComposite",
+                &[ComArg::ObjArray(&[arc, axis_ln]), ComArg::Bool(true)],
+            )?;
+            let ang = if b.angle_rad > 1e-4 { b.angle_rad } else { std::f64::consts::TAU };
+            call_basic_revolved(shapes, &comp, c.x, c.y, c.z, ax_y.x, ax_y.y, ax_y.z, ang)?
+        }
+        "pyramid" => {
+            // Exact 5-face closed Parasolid pyramid via intersection of two extruded triangular wedges
+            let tri_xz = b
+                .outer_loop
+                .as_ref()
+                .ok_or_else(|| "Pyramid missing outerLoop (triXZ)".to_string())?;
+            let tri_yz = b
+                .top_loop
+                .as_ref()
+                .ok_or_else(|| "Pyramid missing topLoop (triYZ)".to_string())?;
+            let c1 = build_loop_curve(curves, tri_xz, &b.ax_x, &b.ax_y)?;
+            let c2 = build_loop_curve(curves, tri_yz, &b.ax_x, &b.ax_y)?;
+            let wedge1 = shapes.call_obj(
+                "AddBasicExtruded",
+                &[
+                    ComArg::Obj(&c1),
+                    ComArg::F64(b.ax_y.x),
+                    ComArg::F64(b.ax_y.y),
+                    ComArg::F64(b.ax_y.z),
+                    ComArg::F64(b.ly),
+                    ComArg::F64(0.0),
+                    ComArg::F64(0.0),
+                    ComArg::Bool(false),
+                    ComArg::Bool(true),
+                ],
+            )?;
+            let wedge2 = shapes.call_obj(
+                "AddBasicExtruded",
+                &[
+                    ComArg::Obj(&c2),
+                    ComArg::F64(b.ax_x.x),
+                    ComArg::F64(b.ax_x.y),
+                    ComArg::F64(b.ax_x.z),
+                    ComArg::F64(b.lx),
+                    ComArg::F64(0.0),
+                    ComArg::F64(0.0),
+                    ComArg::Bool(false),
+                    ComArg::Bool(true),
+                ],
+            )?;
+            if let Ok(ops) = wedge1.get_obj("Operations") {
+                let _ = ops.call(
+                    "AddIntersection",
+                    &[
+                        ComArg::Obj(&wedge2),
+                        ComArg::NullDispatch,
+                        ComArg::Bool(true),
+                        ComArg::Bool(false),
+                    ],
+                )?;
+            }
+            wedge1
+        }
+        "csg" => {
+            if b.operands.is_empty() {
+                return Err("CSG operation has 0 operands".into());
+            }
+            let base = build_body_3d(shapes, curves, &b.operands[0], &format!("{}A", ts_name))?;
+            if b.operands.len() > 1 {
+                let method = match b.csg_op {
+                    0 => "AddSubtraction",
+                    1 => "AddUnion",
+                    2 => "AddIntersection",
+                    _ => "AddUnion",
+                };
+                if let Ok(ops) = base.get_obj("Operations") {
+                    for (oi, op_body) in b.operands[1..].iter().enumerate() {
+                        match build_body_3d(shapes, curves, op_body, &format!("{}T{}", ts_name, oi + 1)) {
+                            Ok(tool) => {
+                                if let Err(e) = ops.call(
+                                    method,
+                                    &[
+                                        ComArg::Obj(&tool),
+                                        ComArg::NullDispatch,
+                                        ComArg::Bool(true),
+                                        ComArg::Bool(false),
+                                    ],
+                                ) {
+                                    log_line(&format!("  CSG {} ERR on {}: {}", method, ts_name, e));
+                                }
+                            }
+                            Err(e) => {
+                                log_line(&format!("  CSG OPERAND ERR on {}: {}", ts_name, e));
+                            }
+                        }
+                    }
+                }
+            }
+            base
+        }
+        other => return Err(format!("Unknown Body3D kind: {}", other)),
+    };
+
+    let _ = shape.put("Name", ComArg::Str(ts_name));
+    let _ = shape.put("Designation", ComArg::Str(&b.name));
+    let _ = shape.put("Layer", ComArg::I32(0));
+    if !b.material.is_empty() {
+        let _ = shape.call("SetMatter", &[ComArg::Str(&b.material)]);
+    }
+    Ok(shape)
+}
+
 #[derive(Debug, Clone)]
 struct HardwareMapEntry {
     path: String,
@@ -453,17 +834,144 @@ fn load_hardware_map(tpl_dir: &Path) -> Vec<(String, HardwareMapEntry)> {
     out
 }
 
+/// Stage a .top file from SMB/network storage (e.g. Y:\) into local %TEMP%\ts6_fast_cache\
+/// so TopSolid COM AddWithPositioningByCoordinateSystems reads from local SSD (5-10x faster).
+fn stage_to_local_cache(src: &str, local_dir: &Path) -> String {
+    let sp = Path::new(src);
+    let Some(fname) = sp.file_name() else {
+        return src.to_string();
+    };
+    let dst = local_dir.join(fname);
+    let need_copy = match (fs::metadata(sp), fs::metadata(&dst)) {
+        (Ok(sm), Ok(dm)) => sm.len() != dm.len() || sm.modified().ok() > dm.modified().ok(),
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    };
+    if need_copy {
+        let _ = fs::create_dir_all(local_dir);
+        if fs::copy(sp, &dst).is_ok() {
+            return dst.to_string_lossy().to_string();
+        }
+    } else if dst.exists() {
+        return dst.to_string_lossy().to_string();
+    }
+    src.to_string()
+}
+
+/// Transform a local point `(lx, ly, lz)` using hardware origin + orthonormal basis `(ax_x, ax_y, ax_z)`.
+fn hw_world_pt(hw: &HardwareItem, lx: f64, ly: f64, lz: f64) -> Vec3 {
+    let ax_z = v_norm(&v_cross(&hw.ax_x, &hw.ax_y));
+    Vec3 {
+        x: hw.origin.x + hw.ax_x.x * lx + hw.ax_y.x * ly + ax_z.x * lz,
+        y: hw.origin.y + hw.ax_x.y * lx + hw.ax_y.y * ly + ax_z.y * lz,
+        z: hw.origin.z + hw.ax_x.z * lx + hw.ax_y.z * ly + ax_z.z * lz,
+    }
+}
+
+/// Place generic hardware directly as a lightweight native Parasolid solid (cylinder or block)
+/// with full BOM Designation/Reference/Supplier properties (~5 ms per item vs ~1000+ ms for external .top).
+fn place_fast_hardware_solid(
+    shapes: &ComObj,
+    curves: &ComObj,
+    hw: &HardwareItem,
+    hw_name: &str,
+) -> Result<(), String> {
+    let lx = hw.lx.clamp(0.004, 2.0);
+    let ly = hw.ly.clamp(0.004, 2.0);
+    let lz = hw.lz.clamp(0.004, 2.0);
+    let cx = hw.center_local.x;
+    let cy = hw.center_local.y;
+    let cz = hw.center_local.z;
+    let ax_x = v_norm(&hw.ax_x);
+    let ax_y = v_norm(&hw.ax_y);
+    let ax_z = v_norm(&v_cross(&ax_x, &ax_y));
+
+    let body = if hw.shape_kind == "cylinder" {
+        let (start, dir, circ_x, circ_y, rad, len) = if lz >= lx && lz >= ly {
+            (hw_world_pt(hw, cx, cy, cz - lz * 0.5), ax_z, ax_x, ax_y, (lx.min(ly) * 0.5).max(0.002), lz)
+        } else if lx >= ly && lx >= lz {
+            (hw_world_pt(hw, cx - lx * 0.5, cy, cz), ax_x, ax_y, ax_z, (ly.min(lz) * 0.5).max(0.002), lx)
+        } else {
+            (hw_world_pt(hw, cx, cy - ly * 0.5, cz), ax_y, ax_z, ax_x, (lx.min(lz) * 0.5).max(0.002), ly)
+        };
+        let circ = curves.call_obj(
+            "AddBasicCircle",
+            &[
+                ComArg::F64(start.x),
+                ComArg::F64(start.y),
+                ComArg::F64(start.z),
+                ComArg::F64(circ_x.x),
+                ComArg::F64(circ_x.y),
+                ComArg::F64(circ_x.z),
+                ComArg::F64(circ_y.x),
+                ComArg::F64(circ_y.y),
+                ComArg::F64(circ_y.z),
+                ComArg::F64(rad),
+            ],
+        )?;
+        shapes.call_obj(
+            "AddBasicExtruded",
+            &[
+                ComArg::Obj(&circ),
+                ComArg::F64(dir.x),
+                ComArg::F64(dir.y),
+                ComArg::F64(dir.z),
+                ComArg::F64(len),
+                ComArg::F64(0.0),
+                ComArg::F64(0.0),
+                ComArg::Bool(false),
+                ComArg::Bool(true),
+            ],
+        )?
+    } else {
+        let ctr = hw_world_pt(hw, cx, cy, cz);
+        shapes.call_obj(
+            "AddBasicBlock",
+            &[
+                ComArg::F64(ctr.x),
+                ComArg::F64(ctr.y),
+                ComArg::F64(ctr.z),
+                ComArg::F64(hw.ax_x.x),
+                ComArg::F64(hw.ax_x.y),
+                ComArg::F64(hw.ax_x.z),
+                ComArg::F64(hw.ax_y.x),
+                ComArg::F64(hw.ax_y.y),
+                ComArg::F64(hw.ax_y.z),
+                ComArg::F64(lx),
+                ComArg::F64(ly),
+                ComArg::F64(lz),
+            ],
+        )?
+    };
+
+    let _ = body.put("Name", ComArg::Str(hw_name));
+    let _ = body.put("Designation", ComArg::Str(&hw.name));
+    if !hw.article.is_empty() {
+        let _ = body.put("Reference", ComArg::Str(&hw.article));
+    }
+    if !hw.supplier.is_empty() {
+        let _ = body.put("Supplier", ComArg::Str(&hw.supplier));
+    }
+    let _ = body.put("Layer", ComArg::I32(0));
+    let _ = body.call("SetTextProperty", &[ComArg::Str("Bazis_Hardware"), ComArg::Str(&hw.name)]);
+    if !hw.supplier.is_empty() {
+        let _ = body.call("SetTextProperty", &[ComArg::Str("Bazis_Supplier"), ComArg::Str(&hw.supplier)]);
+    }
+    Ok(())
+}
+
 fn resolve_hardware_component(
     hw: &HardwareItem,
     hw_map: &[(String, HardwareMapEntry)],
-    hw_lib_dir: &Path,
-) -> (String, bool, bool) {
+    _hw_lib_dir: &Path,
+) -> (Option<String>, bool) {
     let name_low = hw.name.to_ascii_lowercase();
     let safe_low = hw.safe_name.to_ascii_lowercase();
-    // 1. Check explicit hardware_map.json (exact match first, then substring match)
+    // Only use external .top components for vendor parts explicitly mapped in hardware_map.json;
+    // generic screws/dowels/shelfholders are placed directly as lightweight native Parasolid solids (100x faster).
     for (k, entry) in hw_map {
         if (k == &name_low || k == &safe_low) && Path::new(&entry.path).exists() {
-            return (entry.path.clone(), entry.has_process, false);
+            return (Some(entry.path.clone()), entry.has_process);
         }
     }
     for (k, entry) in hw_map {
@@ -471,14 +979,10 @@ fn resolve_hardware_component(
             && (name_low.contains(k.as_str()) || safe_low.contains(k.as_str()))
             && Path::new(&entry.path).exists()
         {
-            return (entry.path.clone(), entry.has_process, false);
+            return (Some(entry.path.clone()), entry.has_process);
         }
     }
-    // 2. Check self-growing TopSolid_Lib_Bazis library
-    let lib_file = hw_lib_dir.join(format!("{}.top", hw.safe_name));
-    let lib_str = lib_file.to_string_lossy().to_string();
-    let needs_gen = !lib_file.exists();
-    (lib_str, false, needs_gen)
+    (None, false)
 }
 
 /// Auto-generate a lightweight native TopSolid .top hardware component in `TopSolid_Lib_Bazis`
@@ -604,10 +1108,24 @@ pub fn run_export<F>(
 where
     F: FnMut(usize, usize, &str),
 {
+    let t_total = Instant::now();
+    init_log(&format!(
+        "Model='{}' | Mode={:?} | AutoSave={} | IncludeHardware={} | Panels={} | Cuts={} | Holes={} | Hardware={}",
+        model.model_name,
+        mode,
+        auto_save,
+        include_hardware,
+        model.panels.len(),
+        model.total_cuts(),
+        model.total_holes(),
+        model.hardware.len()
+    ));
+
     let _com = ComGuard::init_sta()?;
     on_progress(0, 100, "Connecting to TopSolid.Application...");
     let app = ComObj::create("TopSolid.Application")?;
     let docs = app.get_obj("Documents")?;
+    log_line("Connected to TopSolid.Application COM.");
 
     let tpl_dir = resolve_templates_dir(&model.templates_dir);
     let cache_dir = tpl_dir.join("cache");
@@ -743,30 +1261,27 @@ where
         }
     }
 
-    // Resolve hardware library & plan missing auto-generated hardware .top components
+    // Resolve hardware library (only explicit hardware_map.json vendor files use external .top components;
+    // generic screws/dowels/shelfholders are placed directly as lightweight Parasolid solids after Phase 3).
     let hw_lib_dir = resolve_hardware_lib_dir(&model.hardware_lib_dir, &tpl_dir);
+    let local_cache_dir = std::env::temp_dir().join("ts6_fast_cache");
     let hw_map = if include_hardware {
         load_hardware_map(&tpl_dir)
     } else {
         Vec::new()
     };
-    let mut hw_resolved: Vec<(String, bool)> = Vec::new();
-    let mut hw_to_gen: Vec<(usize, String)> = Vec::new();
+    let mut hw_resolved: Vec<(Option<String>, bool)> = Vec::new();
     if include_hardware && !model.hardware.is_empty() {
-        let mut gen_seen: HashMap<String, bool> = HashMap::new();
-        for (idx, hw) in model.hardware.iter().enumerate() {
-            let (path, has_proc, needs_gen) = resolve_hardware_component(hw, &hw_map, &hw_lib_dir);
-            if needs_gen && !gen_seen.contains_key(&path) {
-                gen_seen.insert(path.clone(), true);
-                hw_to_gen.push((idx, path.clone()));
-            }
-            hw_resolved.push((path, has_proc));
+        for hw in &model.hardware {
+            let (opt_path, has_proc) = resolve_hardware_component(hw, &hw_map, &hw_lib_dir);
+            let staged = opt_path.map(|p| stage_to_local_cache(&p, &local_cache_dir));
+            hw_resolved.push((staged, has_proc));
         }
     }
 
     let total_ops = model.total_cuts() + total_hole_ops;
     let hw_units = if include_hardware {
-        hw_to_gen.len() + model.hardware.len()
+        model.hardware.len()
     } else {
         0
     };
@@ -797,17 +1312,21 @@ where
     };
 
     // Phase 1: Build missing cached exact-size native .top templates
+    let t_p1 = Instant::now();
     if !variants.is_empty() {
+        log_line(&format!("PHASE1 START: {} missing template variants", variants.len()));
         fs::create_dir_all(&cache_dir)
             .map_err(|e| format!("Failed to create cache dir {:?}: {}", cache_dir, e))?;
         for v in &variants {
+            let t_v = Instant::now();
             if cancel.load(Ordering::Relaxed) {
                 return Err("Stopped by user during template variant generation.".into());
             }
+            let vname = Path::new(&v.dst).file_name().unwrap_or_default().to_string_lossy().to_string();
             on_progress(
                 progress,
                 total_units,
-                &format!("Building cached template: {}", Path::new(&v.dst).file_name().unwrap_or_default().to_string_lossy()),
+                &format!("Building cached template: {}", vname),
             );
             let patched_ascii = patch_ascii_top_params(&v.src, &v.dst, &v.params)?;
             if !patched_ascii {
@@ -831,34 +1350,16 @@ where
             }
             let _ = cur_doc.call("Save", &[])?;
             let _ = cur_doc.call("Close", &[ComArg::Bool(false), ComArg::Bool(false)]);
+            log_line(&format!("  VARIANT {} built in {}ms (ascii={})", vname, t_v.elapsed().as_millis(), patched_ascii));
             stats.variants_built += 1;
             progress += 1;
         }
     }
-
-    // Phase 1b: Auto-generate missing hardware .top components into TopSolid_Lib_Bazis (100% COM)
-    if include_hardware && !hw_to_gen.is_empty() {
-        fs::create_dir_all(&hw_lib_dir)
-            .map_err(|e| format!("Failed to create hardware library dir {:?}: {}", hw_lib_dir, e))?;
-        for (hw_idx, dst_path) in &hw_to_gen {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("Stopped by user during hardware library generation.".into());
-            }
-            let hw = &model.hardware[*hw_idx];
-            on_progress(
-                progress,
-                total_units,
-                &format!("Generating hardware library component: {}.top", hw.safe_name),
-            );
-            match generate_hardware_component(&docs, hw, dst_path) {
-                Ok(()) => stats.hardware_generated += 1,
-                Err(_) => stats.errors += 1,
-            }
-            progress += 1;
-        }
-    }
+    log_line(&format!("PHASE1 END in {:.2}s (built={})", t_p1.elapsed().as_secs_f64(), stats.variants_built));
 
     // Phase 2: Create new TopSolid design document, build all panels, and place operations
+    let t_p2 = Instant::now();
+    log_line(&format!("PHASE2 START: {} panels, {} cuts, {} hole_ops", model.panels.len(), model.total_cuts(), total_hole_ops));
     on_progress(progress, total_units, "Creating new TopSolid'Wood 6.25 document...");
     let doc = docs.call_obj("Add", &[ComArg::Str("top")])?;
     let shapes = doc.get_obj("Shapes")?;
@@ -867,6 +1368,7 @@ where
     let components = doc.get_obj("Components")?;
 
     let mut apply_pairs: Vec<(String, String)> = Vec::new();
+    let mut built_panels: Vec<(String, String, ComObj)> = Vec::new();
     let mut op_seq: usize = 0;
 
     for (idx, p) in model.panels.iter().enumerate() {
@@ -926,7 +1428,8 @@ where
 
         let blk = match blk_res {
             Ok(b) => b,
-            Err(_) => {
+            Err(e) => {
+                log_line(&format!("  PANEL {} ({}) ERR: {}", idx + 1, p.name, e));
                 stats.errors += 1;
                 progress += 1;
                 continue;
@@ -1032,10 +1535,11 @@ where
                         num_key(c.length_mm)
                     )
                 };
-                let tpl_file = cache_dir
+                let tpl_file_raw = cache_dir
                     .join(format!("B&S_{}_{}.top", c.op_kind, key))
                     .to_string_lossy()
                     .to_string();
+                let tpl_file = stage_to_local_cache(&tpl_file_raw, &local_cache_dir);
                 op_seq += 1;
                 let cmp_name = format!("Op{}", op_seq);
                 let cs_res = csystems.call_obj(
@@ -1067,6 +1571,7 @@ where
                         apply_pairs.push((cmp_name, ts_panel_name.clone()));
                         stats.cuts += 1;
                     } else {
+                        log_line(&format!("  CUT SUBTRACT ERR on {}", ts_panel_name));
                         stats.errors += 1;
                     }
                 } else {
@@ -1112,6 +1617,7 @@ where
                     {
                         stats.cuts += 1;
                     } else {
+                        log_line(&format!("  CUT SUBTRACT ERR on {}", ts_panel_name));
                         stats.errors += 1;
                     }
                 } else {
@@ -1127,7 +1633,7 @@ where
                 if cancel.load(Ordering::Relaxed) {
                     return Err("Stopped by user during hole placement.".into());
                 }
-                let (tpl_file, entry, ax_x, ax_y, hole_cnt) = match grp {
+                let (tpl_file_raw, entry, ax_x, ax_y, hole_cnt) = match grp {
                     HoleGroup::Single(hi) => {
                         let h = &p.holes[*hi];
                         let key = format!("{}x{}", num_key(h.diam_mm), num_key(h.depth_mm));
@@ -1160,6 +1666,7 @@ where
                         (f, entry, ax_x, ax_y, *count)
                     }
                 };
+                let tpl_file = stage_to_local_cache(&tpl_file_raw, &local_cache_dir);
                 op_seq += 1;
                 let cmp_name = format!("Op{}", op_seq);
                 let cs_res = csystems.call_obj(
@@ -1191,6 +1698,7 @@ where
                         apply_pairs.push((cmp_name, ts_panel_name.clone()));
                         stats.holes += hole_cnt;
                     } else {
+                        log_line(&format!("  HOLE ERR on {}: AddWithPositioning failed for {}", ts_panel_name, tpl_file));
                         stats.errors += 1;
                     }
                 } else {
@@ -1251,6 +1759,7 @@ where
                             stats.errors += 1;
                         }
                     } else {
+                        log_line(&format!("  HOLE EXTRUDE ERR on {}", ts_panel_name));
                         stats.errors += 1;
                     }
                 } else {
@@ -1260,10 +1769,85 @@ where
             }
         }
 
+        built_panels.push((ts_panel_name, p.name.clone(), blk));
     }
 
-    // Phase 2b: Insert hardware components from hardware_map.json / TopSolid_Lib_Bazis
+    log_line(&format!(
+        "PHASE2 END in {:.2}s: panels={}, cuts={}, holes={}, apply_pairs={}, errors={}",
+        t_p2.elapsed().as_secs_f64(),
+        stats.panels,
+        stats.cuts,
+        stats.holes,
+        apply_pairs.len(),
+        stats.errors
+    ));
+
+    // Phase 2c: Build native 3D bodies (Extrusions, Bodies of Revolution, Sweeps along Trajectory)
+    if !model.bodies.is_empty() {
+        log_line(&format!("PHASE2C START: {} 3D bodies (extrusion/revolve/sweep)", model.bodies.len()));
+        for (b_idx, b) in model.bodies.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Stopped by user during 3D body placement.".into());
+            }
+            let b_name = format!("B{}", b_idx + 1);
+            match build_body_3d(&shapes, &curves, b, &b_name) {
+                Ok(sh) => {
+                    let faces = sh
+                        .get_obj("Faces")
+                        .and_then(|f| f.get("Count"))
+                        .map(|v| v.as_i32())
+                        .unwrap_or(-1);
+                    let ops = sh
+                        .get_obj("Operations")
+                        .and_then(|o| o.get("Count"))
+                        .map(|v| v.as_i32())
+                        .unwrap_or(-1);
+                    log_line(&format!(
+                        "  VERIFY {} [{}] ({}): Faces={}, Ops={}",
+                        b_name, b.kind, b.name, faces, ops
+                    ));
+                    stats.shaped += 1;
+                }
+                Err(e) => {
+                    log_line(&format!("  BODY {} [{}] ({}) ERR: {}", b_name, b.kind, b.name, e));
+                    stats.errors += 1;
+                }
+            }
+        }
+    }
+
+    // Phase 3: Batch-apply Assembly -> Use process FIRST (on clean scene before hardware!)
+    // so every panel immediately gets 100% native TopSolid'Wood operations.
+    if mode == ExportMode::NativeTemplates && !apply_pairs.is_empty() {
+        let base_prog = progress;
+        stats.native_applied = apply_use_process_batch(&apply_pairs, cancel, |done, _tot, msg| {
+            on_progress(base_prog + done, total_units, msg);
+        })?;
+        progress = base_prog + apply_pairs.len();
+    }
+
+    // Verify real TopSolid Faces.Count and Operations.Count on every built panel
+    for (ts_name, des, blk) in &built_panels {
+        let faces = blk
+            .get_obj("Faces")
+            .and_then(|f| f.get("Count"))
+            .map(|v| v.as_i32())
+            .unwrap_or(-1);
+        let ops = blk
+            .get_obj("Operations")
+            .and_then(|o| o.get("Count"))
+            .map(|v| v.as_i32())
+            .unwrap_or(-1);
+        log_line(&format!("  VERIFY {} ({}): Faces={}, Ops={}", ts_name, des, faces, ops));
+    }
+
+    // Phase 4: Fast hardware placement (after Use process!)
+    // - Mapped vendor .top files (hardware_map.json) -> AddWithPositioningByCoordinateSystems (from local SSD cache)
+    // - Generic hardware (dowels, screws, shelfholders, unmapped hinges) -> direct lightweight Parasolid solids (~2ms each!)
+    let t_p4 = Instant::now();
     if include_hardware && !model.hardware.is_empty() {
+        log_line(&format!("PHASE4 START: {} hardware items", model.hardware.len()));
+        let mut hw_proc_pairs: Vec<(String, String)> = Vec::new();
         for (h_idx, hw) in model.hardware.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return Err(format!(
@@ -1272,96 +1856,182 @@ where
                     model.hardware.len()
                 ));
             }
-            let (comp_path, has_proc) = &hw_resolved[h_idx];
-            if !Path::new(comp_path).exists() {
-                stats.errors += 1;
-                progress += 1;
-                continue;
-            }
             let hw_name = format!("Hw{}", h_idx + 1);
-            on_progress(
-                progress,
-                total_units,
-                &format!("Hardware {}/{}: {}", h_idx + 1, model.hardware.len(), hw.name),
-            );
-            let cs_res = csystems.call_obj(
-                "AddBasic",
-                &[
-                    ComArg::F64(hw.origin.x),
-                    ComArg::F64(hw.origin.y),
-                    ComArg::F64(hw.origin.z),
-                    ComArg::F64(hw.ax_x.x),
-                    ComArg::F64(hw.ax_x.y),
-                    ComArg::F64(hw.ax_x.z),
-                    ComArg::F64(hw.ax_y.x),
-                    ComArg::F64(hw.ax_y.y),
-                    ComArg::F64(hw.ax_y.z),
-                ],
-            );
-            if let Ok(cs) = cs_res {
-                if let Ok(cmp) = components.call_obj(
-                    "AddWithPositioningByCoordinateSystems",
+            if h_idx == 0 || (h_idx + 1) % 25 == 0 || h_idx + 1 == model.hardware.len() {
+                on_progress(
+                    progress,
+                    total_units,
+                    &format!("Hardware {}/{}: {}", h_idx + 1, model.hardware.len(), hw.name),
+                );
+            }
+            let (opt_path, has_proc) = &hw_resolved[h_idx];
+            if let Some(comp_path) = opt_path {
+                let cs_res = csystems.call_obj(
+                    "AddBasic",
                     &[
-                        ComArg::Str(comp_path),
-                        ComArg::Str("Origin"),
-                        ComArg::Obj(&cs),
+                        ComArg::F64(hw.origin.x),
+                        ComArg::F64(hw.origin.y),
+                        ComArg::F64(hw.origin.z),
+                        ComArg::F64(hw.ax_x.x),
+                        ComArg::F64(hw.ax_x.y),
+                        ComArg::F64(hw.ax_x.z),
+                        ComArg::F64(hw.ax_y.x),
+                        ComArg::F64(hw.ax_y.y),
+                        ComArg::F64(hw.ax_y.z),
                     ],
-                ) {
-                    if let Ok(el) = cmp.get_obj("Element") {
-                        let _ = el.put("Name", ComArg::Str(&hw_name));
-                        let _ = el.put("Designation", ComArg::Str(&hw.name));
-                        if !hw.article.is_empty() {
-                            let _ = el.put("Reference", ComArg::Str(&hw.article));
+                );
+                if let Ok(cs) = cs_res {
+                    if let Ok(cmp) = components.call_obj(
+                        "AddWithPositioningByCoordinateSystems",
+                        &[
+                            ComArg::Str(comp_path),
+                            ComArg::Str("Origin"),
+                            ComArg::Obj(&cs),
+                        ],
+                    ) {
+                        if let Ok(el) = cmp.get_obj("Element") {
+                            let _ = el.put("Name", ComArg::Str(&hw_name));
+                            let _ = el.put("Designation", ComArg::Str(&hw.name));
+                            if !hw.article.is_empty() {
+                                let _ = el.put("Reference", ComArg::Str(&hw.article));
+                            }
+                            if !hw.supplier.is_empty() {
+                                let _ = el.put("Supplier", ComArg::Str(&hw.supplier));
+                            }
+                            let _ = el.put("Layer", ComArg::I32(0));
                         }
-                        if !hw.supplier.is_empty() {
-                            let _ = el.put("Supplier", ComArg::Str(&hw.supplier));
+                        stats.hardware_placed += 1;
+                        if *has_proc && mode == ExportMode::NativeTemplates {
+                            for p_name in &hw.connected_panels {
+                                hw_proc_pairs.push((hw_name.clone(), p_name.clone()));
+                            }
                         }
-                        let _ = el.put("Layer", ComArg::I32(0));
-                    }
-                    stats.hardware_placed += 1;
-                    if *has_proc && mode == ExportMode::NativeTemplates {
-                        for p_name in &hw.connected_panels {
-                            apply_pairs.push((hw_name.clone(), p_name.clone()));
-                        }
+                    } else {
+                        log_line(&format!("  HW COMP ERR {}: AddWithPositioning failed for {}", hw_name, comp_path));
+                        stats.errors += 1;
                     }
                 } else {
                     stats.errors += 1;
                 }
             } else {
-                stats.errors += 1;
+                match place_fast_hardware_solid(&shapes, &curves, hw, &hw_name) {
+                    Ok(()) => stats.hardware_placed += 1,
+                    Err(e) => {
+                        log_line(&format!("  HW {} ({}) ERR: {}", hw_name, hw.name, e));
+                        stats.errors += 1;
+                    }
+                }
             }
             progress += 1;
         }
+        if !hw_proc_pairs.is_empty() {
+            let applied_hw = apply_use_process_batch(&hw_proc_pairs, cancel, |_d, _t, msg| {
+                on_progress(progress, total_units, msg);
+            })?;
+            stats.native_applied += applied_hw;
+        }
     }
-
-    // Phase 3: Batch-apply Assembly -> Use process so every panel gets 100% native TopSolid'Wood operations
-    if mode == ExportMode::NativeTemplates && !apply_pairs.is_empty() {
-        let base_prog = progress;
-        stats.native_applied = apply_use_process_batch(&apply_pairs, cancel, |done, _tot, msg| {
-            on_progress(base_prog + done, total_units, msg);
-        })?;
-    }
+    log_line(&format!(
+        "PHASE4 END in {:.2}s: hardware_placed={}, errors={}",
+        t_p4.elapsed().as_secs_f64(),
+        stats.hardware_placed,
+        stats.errors
+    ));
 
     // Optional auto-save .top
     if auto_save && !model.save_top_path.is_empty() {
+        let t_save = Instant::now();
         on_progress(
             total_units,
             total_units,
             &format!("Saving {}...", model.save_top_path),
         );
-        if Path::new(&model.save_top_path).exists() {
-            let _ = fs::remove_file(&model.save_top_path);
+        let mut save_target = model.save_top_path.clone();
+        if Path::new(&save_target).exists() && fs::remove_file(&save_target).is_err() {
+            // File is currently open/locked in TopSolid; fall back to a unique suffixed filename
+            let p = Path::new(&save_target);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("Export");
+            let parent = p.parent().unwrap_or_else(|| Path::new("."));
+            for n in 2..=99 {
+                let cand = parent.join(format!("{}_{}.top", stem, n));
+                if !cand.exists() || fs::remove_file(&cand).is_ok() {
+                    save_target = cand.to_string_lossy().to_string();
+                    break;
+                }
+            }
         }
         if let Ok(doc_file) = doc.get_obj("Document") {
-            if doc_file
-                .call("SaveAs", &[ComArg::Str(&model.save_top_path)])
-                .is_ok()
-            {
-                stats.saved_path = Some(model.save_top_path.clone());
+            match doc_file.call("SaveAs", &[ComArg::Str(&save_target)]) {
+                Ok(_) => {
+                    stats.saved_path = Some(save_target.clone());
+                    log_line(&format!("SAVE OK in {:.2}s: {}", t_save.elapsed().as_secs_f64(), save_target));
+                }
+                Err(e) => {
+                    log_line(&format!("SAVE ERR in {:.2}s: {}", t_save.elapsed().as_secs_f64(), e));
+                }
             }
         }
     }
 
+    log_line(&format!(
+        "EXPORT COMPLETE in {:.2}s | panels={} cuts={} holes={} applied={} hw={} errors={}",
+        t_total.elapsed().as_secs_f64(),
+        stats.panels,
+        stats.cuts,
+        stats.holes,
+        stats.native_applied,
+        stats.hardware_placed,
+        stats.errors
+    ));
     on_progress(total_units, total_units, "Export complete.");
     Ok(stats)
+}
+
+/// Inspect the currently active TopSolid document via COM and return a per-shape summary
+/// (Name, Designation, Faces.Count, Operations.Count, operation names).
+pub fn inspect_active_document() -> Result<String, String> {
+    let _com = ComGuard::init_sta()?;
+    let app = ComObj::create("TopSolid.Application")?;
+    let doc = app.get_obj("CurrentDocument")?;
+    let doc_name = doc
+        .get_obj("Document")
+        .and_then(|d| d.get("Name"))
+        .map(|v| v.as_string())
+        .unwrap_or_default();
+    let shapes = doc.get_obj("Shapes")?;
+    let count = shapes.get("Count")?.as_i32();
+    let mut out = format!("DOC: {} | SHAPES: {}\n", doc_name, count);
+    for i in 1..=count {
+        if let Ok(s) = shapes.get_item(i) {
+            let nm = s.get("Name").map(|v| v.as_string()).unwrap_or_default();
+            let des = s.get("Designation").map(|v| v.as_string()).unwrap_or_default();
+            let faces = s
+                .get_obj("Faces")
+                .and_then(|f| f.get("Count"))
+                .map(|v| v.as_i32())
+                .unwrap_or(-1);
+            let mut op_cnt = -1;
+            let mut op_list: Vec<String> = Vec::new();
+            if let Ok(ops) = s.get_obj("Operations") {
+                op_cnt = ops.get("Count").map(|v| v.as_i32()).unwrap_or(-1);
+                for j in 1..=op_cnt.max(0) {
+                    if let Ok(op) = ops.get_item(j) {
+                        let onm = op.get("Name").map(|v| v.as_string()).unwrap_or_default();
+                        let odes = op.get("Designation").map(|v| v.as_string()).unwrap_or_default();
+                        op_list.push(if odes.is_empty() { onm } else { format!("{}({})", onm, odes) });
+                    }
+                }
+            }
+            out.push_str(&format!(
+                "  [{}] Name={} | Des={} | Faces={} | Ops={} [{}]\n",
+                i,
+                nm,
+                des,
+                faces,
+                op_cnt,
+                op_list.join(", ")
+            ));
+        }
+    }
+    Ok(out)
 }

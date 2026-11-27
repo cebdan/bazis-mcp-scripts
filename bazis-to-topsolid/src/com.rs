@@ -279,6 +279,16 @@ impl ComObj {
             .into_obj()
             .ok_or_else(|| format!("Method '{}' returned null object", name))
     }
+
+    pub fn get_item(&self, idx: i32) -> Result<ComObj, String> {
+        self.invoke_raw(
+            "Item",
+            (DISPATCH_PROPERTYGET | DISPATCH_METHOD) as u16,
+            &[ComArg::I32(idx)],
+        )?
+        .into_obj()
+        .ok_or_else(|| format!("Item({}) returned null object", idx))
+    }
 }
 
 impl Drop for ComObj {
@@ -340,18 +350,15 @@ impl<'a> ComArg<'a> {
                         cElements: objs.len() as u32,
                         lLbound: 0,
                     };
-                    let psa: *mut SAFEARRAY = SafeArrayCreate(VT_VARIANT, 1, &bound);
+                    let psa: *mut SAFEARRAY = SafeArrayCreate(VT_DISPATCH, 1, &bound);
                     if !psa.is_null() {
                         for (idx, obj) in objs.iter().enumerate() {
-                            let mut elem: VARIANT = std::mem::zeroed();
-                            VariantInit(&mut elem);
-                            elem.Anonymous.Anonymous.vt = VT_DISPATCH;
-                            elem.Anonymous.Anonymous.Anonymous.pdispVal = obj.add_ref_raw();
                             let i = idx as i32;
-                            SafeArrayPutElement(psa, &i, &elem as *const VARIANT as *const c_void);
-                            VariantClear(&mut elem);
+                            // SafeArrayPutElement on VT_DISPATCH takes the IDispatch* directly and AddRefs it
+                            let pdisp = obj.raw();
+                            SafeArrayPutElement(psa, &i, pdisp);
                         }
-                        v.Anonymous.Anonymous.vt = VT_ARRAY | VT_VARIANT;
+                        v.Anonymous.Anonymous.vt = VT_ARRAY | VT_DISPATCH;
                         v.Anonymous.Anonymous.Anonymous.parray = psa;
                     } else {
                         v.Anonymous.Anonymous.vt = VT_EMPTY;

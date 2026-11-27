@@ -124,6 +124,70 @@ fn default_hw_dim() -> f64 {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SweepSeg {
+    pub kind: String, // "extrude" | "revolve"
+    pub profile_loop: ContourLoop,
+    pub ax_x: Vec3,
+    pub ax_y: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub dir: Vec3,
+    #[serde(default)]
+    pub length: f64,
+    #[serde(default = "default_vec3_zero")]
+    pub axis_origin: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub axis_dir: Vec3,
+    #[serde(default)]
+    pub angle_rad: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Body3D {
+    pub kind: String, // "extrusion" | "revolve" | "sweep" | "pyramid" | "sphere" | "box" | "csg"
+    pub name: String,
+    #[serde(default)]
+    pub material: String,
+    #[serde(default)]
+    pub outer_loop: Option<ContourLoop>,
+    #[serde(default)]
+    pub top_loop: Option<ContourLoop>,
+    #[serde(default)]
+    pub inner_loops: Vec<ContourLoop>,
+    #[serde(default = "default_vec3_zero")]
+    pub center: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub ax_x: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub ax_y: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub dir: Vec3,
+    #[serde(default)]
+    pub lx: f64,
+    #[serde(default)]
+    pub ly: f64,
+    #[serde(default)]
+    pub lz: f64,
+    #[serde(default)]
+    pub length: f64,
+    #[serde(default)]
+    pub radius: f64,
+    #[serde(default = "default_vec3_zero")]
+    pub axis_origin: Vec3,
+    #[serde(default = "default_vec3_zero")]
+    pub axis_dir: Vec3,
+    #[serde(default)]
+    pub angle_rad: f64,
+    #[serde(default)]
+    pub segments: Vec<SweepSeg>,
+    #[serde(default)]
+    pub csg_op: i32, // 0=subtract, 1=union, 2=intersect
+    #[serde(default)]
+    pub operands: Vec<Body3D>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BazisExportModel {
     pub model_name: String,
     #[serde(default)]
@@ -133,6 +197,8 @@ pub struct BazisExportModel {
     #[serde(default)]
     pub save_top_path: String,
     pub panels: Vec<PanelData>,
+    #[serde(default)]
+    pub bodies: Vec<Body3D>,
     #[serde(default)]
     pub hardware: Vec<HardwareItem>,
 }

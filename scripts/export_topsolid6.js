@@ -97,6 +97,8 @@ function collectPanels(container, out) {
     for (var i = 0; i < container.Count; i++) {
         var obj = container.Objects[i];
         if (!obj || obj.Visible === false) continue;
+        // Skip TCSGOperation subtrees — their operand panels belong to the boolean body
+        if (typeof obj.CSGFunction === "number") continue;
         if (obj.AsPanel) {
             out.push(obj.AsPanel);
         } else if (obj.Count > 0) {
@@ -120,30 +122,40 @@ function extractContourLoops(panel, zLocal) {
                 p2: { x: el.Pos2.x, y: el.Pos2.y }
             });
         } else if (el.ElType === 2) { // Arc
-            var mid = el.ArcCenter ? null : null;
-            var pMid = el.ElCenter ? { x: el.ElCenter.x, y: el.ElCenter.y } : null;
-            // Compute exact arc midpoint from Pos1, Pos2, Center, Dir
-            var cx = el.Center.x, cy = el.Center.y, r = el.Radius;
-            var a1 = Math.atan2(el.Pos1.y - cy, el.Pos1.x - cx);
-            var a2 = Math.atan2(el.Pos2.y - cy, el.Pos2.x - cx);
-            var da = a2 - a1;
-            if (el.ArcDir) {
-                if (da <= 0) da += 2 * Math.PI;
-            } else {
-                if (da >= 0) da -= 2 * Math.PI;
+            var ctr = el.Center || el.ArcCenter || null;
+            var cx = ctr ? Number(ctr.x) : (el.Pos1.x + el.Pos2.x) / 2;
+            var cy = ctr ? Number(ctr.y) : (el.Pos1.y + el.Pos2.y) / 2;
+            var r = (typeof el.Radius === "number" && isFinite(el.Radius) && el.Radius > 0)
+                ? el.Radius
+                : (typeof el.ArcRadius === "function" ? Number(el.ArcRadius()) : Math.sqrt(Math.pow(el.Pos1.x - cx, 2) + Math.pow(el.Pos1.y - cy, 2)));
+            var pmx = (el.Pos1.x + el.Pos2.x) / 2;
+            var pmy = (el.Pos1.y + el.Pos2.y) / 2;
+            if (isFinite(cx) && isFinite(cy) && isFinite(r) && r > 1e-6) {
+                var a1 = Math.atan2(el.Pos1.y - cy, el.Pos1.x - cx);
+                var a2 = Math.atan2(el.Pos2.y - cy, el.Pos2.x - cx);
+                var da = a2 - a1;
+                if (el.ArcDir) {
+                    if (da <= 0) da += 2 * Math.PI;
+                } else {
+                    if (da >= 0) da -= 2 * Math.PI;
+                }
+                var am = a1 + da / 2;
+                pmx = cx + r * Math.cos(am);
+                pmy = cy + r * Math.sin(am);
             }
-            var am = a1 + da / 2;
             segs.push({
                 kind: "arc",
                 p1: { x: el.Pos1.x, y: el.Pos1.y },
-                pm: { x: cx + r * Math.cos(am), y: cy + r * Math.sin(am) },
+                pm: { x: pmx, y: pmy },
                 p2: { x: el.Pos2.x, y: el.Pos2.y }
             });
         } else if (el.ElType === 3) { // Full circle
+            var c3 = el.Center || el.CirCenter || { x: 0, y: 0 };
+            var r3 = (typeof el.Radius === "number" && isFinite(el.Radius)) ? el.Radius : (typeof el.CirRadius === "function" ? Number(el.CirRadius()) : 10);
             segs.push({
                 kind: "circle",
-                center: { x: el.Center.x, y: el.Center.y },
-                radius: el.Radius
+                center: { x: c3.x, y: c3.y },
+                radius: r3
             });
         }
     }
@@ -352,8 +364,8 @@ function extractHardwareTransformAndBox(obj) {
     var lx = 0.02, ly = 0.02, lz = 0.02;
     var centerLocal = { x: 0, y: 0, z: 0 };
     try {
-        var gMin = obj.GMin;
-        var gMax = obj.GMax;
+        var gMin = obj.GabMin || obj.GMin;
+        var gMax = obj.GabMax || obj.GMax;
         if (gMin && gMax) {
             var gx = [gMin.x, gMax.x], gy = [gMin.y, gMax.y], gz = [gMin.z, gMax.z];
             var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, minZ = 1e9, maxZ = -1e9;
@@ -407,6 +419,7 @@ function collectHardware(container, panelUidToTsName, out) {
         var obj = container.Objects[i];
         if (!obj || obj.Visible === false) continue;
         if (obj.AsPanel) continue;
+        if (typeof obj.CSGFunction === "number") continue;
 
         var isFastener = false;
         try { isFastener = !!(obj.Holes && obj.Holes.Count >= 0); } catch (e) { isFastener = false; }
@@ -420,7 +433,14 @@ function collectHardware(container, panelUidToTsName, out) {
             var rawName = "";
             try { rawName = obj.Name || ""; } catch (e) {}
             var name = cleanHardwareName(rawName);
-            if (!name || name === "Model") continue;
+            // Bazis wraps loaded .fr3d fragments (legs, hangers, etc.) inside an outer block named "Model";
+            // recurse into it so we pick up the real named fragment block inside!
+            if (!name || name === "Model") {
+                if (childCount > 0) {
+                    collectHardware(obj, panelUidToTsName, out);
+                }
+                continue;
+            }
 
             var art = "";
             try { art = String(obj.ArtPos || "").trim(); } catch (e) {}
@@ -552,6 +572,32 @@ function extractPanelData(panel, idx) {
                 cutAxX = cutAxY;
                 cutAxY = { x: -tmpX.x, y: -tmpX.y, z: -tmpX.z };
             }
+            // For edge operations (rabbet / moulding), Origin (0,0,0) in B&S_Rabbet.top / B&S_Moulding.top
+            // lies directly ON the outer panel edge (Y=0) and cuts inward along +Y (0..W).
+            // Snap entryPt to the touched panel edge and orient +Y inward toward panel center.
+            if (opKind === "rabbet" || opKind === "moulding") {
+                if ((gx2 - gx1) >= (gy2 - gy1)) {
+                    if (Math.abs(gy1 - cMin.y) <= Math.abs(gy2 - cMax.y)) {
+                        entryPt = NewVector((gx1 + gx2) / 2, cMin.y, entryZ);
+                    } else {
+                        entryPt = NewVector((gx1 + gx2) / 2, cMax.y, entryZ);
+                    }
+                } else {
+                    if (Math.abs(gx1 - cMin.x) <= Math.abs(gx2 - cMax.x)) {
+                        entryPt = NewVector(cMin.x, (gy1 + gy2) / 2, entryZ);
+                    } else {
+                        entryPt = NewVector(cMax.x, (gy1 + gy2) / 2, entryZ);
+                    }
+                }
+                var cutCenterTs = toTsPt(panel.ToGlobal(entryPt));
+                var toPanelCenter = vSub(center, cutCenterTs);
+                if (vDot(cutAxY, toPanelCenter) < 0) {
+                    cutAxX = { x: -cutAxX.x, y: -cutAxX.y, z: -cutAxX.z };
+                    cutAxY = { x: -cutAxY.x, y: -cutAxY.y, z: -cutAxY.z };
+                }
+            }
+            var actualDepth = Math.min(profZ2, lz) - Math.max(profZ1, 0);
+            if (actualDepth < 0.1) actualDepth = Math.min(profZ, lz);
             cuts.push({
                 opKind: opKind,
                 name: cut.Name || (opKind + "_" + (ci + 1)),
@@ -568,7 +614,7 @@ function extractPanelData(panel, idx) {
                 boxLmm: Math.round((gy2 - gy1) * 10) / 10,
                 widthMm: Math.round(profW * 10) / 10,
                 lengthMm: Math.round(Math.max(gx2 - gx1, gy2 - gy1) * 10) / 10,
-                depthMm: Math.round(Math.min(profZ, lz) * 10) / 10
+                depthMm: Math.round(actualDepth * 10) / 10
             });
         }
     }
@@ -905,11 +951,376 @@ function resolveRustExe() {
     return null;
 }
 
+function extract2DSegs(contour) {
+    var segs = [];
+    if (!contour) return segs;
+    var n = contour.Count || 0;
+    for (var i = 0; i < n; i++) {
+        var el = contour.Objects[i];
+        if (!el) continue;
+        if (el.ElType === 1) {
+            segs.push({
+                kind: "line",
+                p1: { x: el.Pos1.x, y: el.Pos1.y },
+                p2: { x: el.Pos2.x, y: el.Pos2.y }
+            });
+        } else if (el.ElType === 2) {
+            var ctr = el.Center || el.ArcCenter || null;
+            var cx = ctr ? Number(ctr.x) : (el.Pos1.x + el.Pos2.x) / 2;
+            var cy = ctr ? Number(ctr.y) : (el.Pos1.y + el.Pos2.y) / 2;
+            var r = (typeof el.Radius === "number" && isFinite(el.Radius) && el.Radius > 0)
+                ? el.Radius
+                : (typeof el.ArcRadius === "function" ? Number(el.ArcRadius()) : Math.sqrt(Math.pow(el.Pos1.x - cx, 2) + Math.pow(el.Pos1.y - cy, 2)));
+            var a1 = Math.atan2(el.Pos1.y - cy, el.Pos1.x - cx);
+            var a2 = Math.atan2(el.Pos2.y - cy, el.Pos2.x - cx);
+            var da = a2 - a1;
+            if (el.ArcDir) {
+                if (da <= 0) da += 2 * Math.PI;
+            } else {
+                if (da >= 0) da -= 2 * Math.PI;
+            }
+            var am = a1 + da / 2;
+            segs.push({
+                kind: "arc",
+                p1: { x: el.Pos1.x, y: el.Pos1.y },
+                pm: { x: cx + r * Math.cos(am), y: cy + r * Math.sin(am) },
+                p2: { x: el.Pos2.x, y: el.Pos2.y },
+                cx: cx, cy: cy, r: r, a1: a1, da: da
+            });
+        } else if (el.ElType === 3) {
+            var c3 = el.Center || el.CirCenter || { x: 0, y: 0 };
+            var r3 = 0;
+            if (typeof el.CirRadius === "number" && isFinite(el.CirRadius) && el.CirRadius > 0) r3 = el.CirRadius;
+            else if (typeof el.Radius === "number" && isFinite(el.Radius) && el.Radius > 0) r3 = el.Radius;
+            else if (typeof el.CirRadius === "function") r3 = Number(el.CirRadius());
+            if (!isFinite(r3) || r3 <= 0) r3 = 10;
+            segs.push({
+                kind: "circle",
+                center: { x: c3.x, y: c3.y },
+                radius: r3
+            });
+        }
+    }
+    return segs;
+}
+
+function map2DLoopWithTransform(segs2d, mapPtFn) {
+    var segs3d = [];
+    for (var k = 0; k < segs2d.length; k++) {
+        var sg = segs2d[k];
+        if (sg.kind === "line") {
+            segs3d.push({ kind: "line", p1: mapPtFn(sg.p1.x, sg.p1.y), p2: mapPtFn(sg.p2.x, sg.p2.y) });
+        } else if (sg.kind === "arc") {
+            segs3d.push({ kind: "arc", p1: mapPtFn(sg.p1.x, sg.p1.y), pm: mapPtFn(sg.pm.x, sg.pm.y), p2: mapPtFn(sg.p2.x, sg.p2.y) });
+        } else if (sg.kind === "circle") {
+            segs3d.push({ kind: "circle", center: mapPtFn(sg.center.x, sg.center.y), radius: sg.radius * MM_TO_M });
+        }
+    }
+    return { area: 1, segs: segs3d };
+}
+
+function isStandaloneBody3D(obj) {
+    if (!obj || obj.AsPanel) return false;
+    var hasEx = false, hasTr = false;
+    try { hasEx = !!(obj.Contour && typeof obj.Thickness === "number" && obj.Thickness > 0.1 && !obj.Trajectory2D); } catch (e) {}
+    try { hasTr = !!(obj.Contour2D && obj.Trajectory2D && obj.Contour2D.Count > 0 && obj.Trajectory2D.Count > 0); } catch (e) {}
+    return hasEx || hasTr;
+}
+
+function makeRectLoop3D(obj, x1, y1, x2, y2, zLocal) {
+    var p1 = toTsPt(obj.ToGlobal(NewVector(x1, y1, zLocal)));
+    var p2 = toTsPt(obj.ToGlobal(NewVector(x2, y1, zLocal)));
+    var p3 = toTsPt(obj.ToGlobal(NewVector(x2, y2, zLocal)));
+    var p4 = toTsPt(obj.ToGlobal(NewVector(x1, y2, zLocal)));
+    return {
+        area: Math.abs((x2 - x1) * (y2 - y1)),
+        segs: [
+            { kind: "line", p1: p1, p2: p2 },
+            { kind: "line", p1: p2, p2: p3 },
+            { kind: "line", p1: p3, p2: p4 },
+            { kind: "line", p1: p4, p2: p1 }
+        ]
+    };
+}
+
+function extractBody3D(obj, idxHint) {
+    if (!obj) return null;
+    try {
+        if (obj.constructor && obj.constructor.name === "TModelLimits") return null;
+    } catch (e) {}
+    var matName = "";
+    try { matName = String(obj.MaterialName || "").split("\r")[0].trim(); } catch (e) {}
+    var bName = String(obj.Name || ("Body_" + idxHint));
+
+    // Case A: TCSGOperation (recursive boolean: 0=subtract, 1=union, 2=intersect)
+    if (typeof obj.CSGFunction === "number" && obj.Count > 0) {
+        var ops = [];
+        for (var c = 0; c < obj.Count; c++) {
+            var ch = extractBody3D(obj.Objects[c], idxHint + "_" + c);
+            if (ch) ops.push(ch);
+        }
+        if (ops.length > 0) {
+            return {
+                kind: "csg",
+                name: bName,
+                material: matName,
+                csgOp: Number(obj.CSGFunction),
+                operands: ops
+            };
+        }
+        return null;
+    }
+
+    // Case B: TFurnPanel operand inside a TCSGOperation
+    if (obj.AsPanel) {
+        var pd = extractPanelData(obj.AsPanel, 0);
+        if (pd.isRect || !pd.outerLoop) {
+            return {
+                kind: "box",
+                name: bName,
+                material: pd.material,
+                center: pd.center,
+                axX: pd.axX,
+                axY: pd.axY,
+                lx: pd.lx,
+                ly: pd.ly,
+                lz: pd.lz
+            };
+        }
+        return {
+            kind: "extrusion",
+            name: bName,
+            material: pd.material,
+            outerLoop: pd.outerLoop,
+            innerLoops: pd.innerLoops || [],
+            axX: pd.axX,
+            axY: pd.axY,
+            dir: pd.axZ,
+            length: pd.lz
+        };
+    }
+
+    // Case C: TSphere3D (Radius, StartAngle, EndAngle, center at local (0,0,0))
+    if (typeof obj.Radius === "number" && obj.Radius > 0.1 && typeof obj.StartAngle === "number") {
+        var sp0 = obj.ToGlobal(NewVector(0, 0, 0));
+        var saxX = toTsDir(vSub(obj.ToGlobal(NewVector(1, 0, 0)), sp0));
+        var saxY = toTsDir(vSub(obj.ToGlobal(NewVector(0, 1, 0)), sp0));
+        var ang = Math.abs(Number(obj.EndAngle || (2 * Math.PI)) - Number(obj.StartAngle || 0));
+        if (ang < 1e-4) ang = 2 * Math.PI;
+        return {
+            kind: "sphere",
+            name: bName,
+            material: matName,
+            center: toTsPt(sp0),
+            axX: saxX,
+            axY: saxY,
+            radius: obj.Radius * MM_TO_M,
+            angleRad: ang
+        };
+    }
+
+    // Case D: TPyramid3D (Width along X, Height along Y, Depth along Z: base at Z=0, apex at Z=Depth)
+    // Exact 5-face closed Parasolid pyramid = AddIntersection of two extruded triangular wedges (XZ wedge along Y & YZ wedge along X)
+    if (typeof obj.Width === "number" && typeof obj.Height === "number" && typeof obj.Depth === "number" &&
+        obj.Width > 0.1 && obj.Height > 0.1 && obj.Depth > 0.1 && !obj.Contour && !obj.Trajectory2D) {
+        var pp0 = obj.ToGlobal(NewVector(0, 0, 0));
+        var paxX = toTsDir(vSub(obj.ToGlobal(NewVector(1, 0, 0)), pp0));
+        var paxY = toTsDir(vSub(obj.ToGlobal(NewVector(0, 1, 0)), pp0));
+        var hw = obj.Width / 2, hh = obj.Height / 2, dep = obj.Depth;
+        // Wedge 1: triangle in XZ plane at y = -hh, extruded along +Y by Height
+        var w1p1 = toTsPt(obj.ToGlobal(NewVector(-hw, -hh, 0)));
+        var w1p2 = toTsPt(obj.ToGlobal(NewVector(hw, -hh, 0)));
+        var w1p3 = toTsPt(obj.ToGlobal(NewVector(0, -hh, dep)));
+        var triXZ = {
+            area: hw * dep,
+            segs: [
+                { kind: "line", p1: w1p1, p2: w1p2 },
+                { kind: "line", p1: w1p2, p2: w1p3 },
+                { kind: "line", p1: w1p3, p2: w1p1 }
+            ]
+        };
+        // Wedge 2: triangle in YZ plane at x = -hw, extruded along +X by Width
+        var w2p1 = toTsPt(obj.ToGlobal(NewVector(-hw, -hh, 0)));
+        var w2p2 = toTsPt(obj.ToGlobal(NewVector(-hw, hh, 0)));
+        var w2p3 = toTsPt(obj.ToGlobal(NewVector(-hw, 0, dep)));
+        var triYZ = {
+            area: hh * dep,
+            segs: [
+                { kind: "line", p1: w2p1, p2: w2p2 },
+                { kind: "line", p1: w2p2, p2: w2p3 },
+                { kind: "line", p1: w2p3, p2: w2p1 }
+            ]
+        };
+        return {
+            kind: "pyramid",
+            name: bName,
+            material: matName,
+            outerLoop: triXZ,
+            topLoop: triYZ,
+            axX: paxX,
+            axY: paxY,
+            lx: obj.Width * MM_TO_M,
+            ly: obj.Height * MM_TO_M
+        };
+    }
+
+    // Case E: TExtrusionBody (Contour + Thickness)
+    var isEx = false;
+    try { isEx = !!(obj.Contour && obj.Contour.Count > 0 && typeof obj.Thickness === "number" && obj.Thickness > 0.1 && !obj.Trajectory2D); } catch (e) {}
+    if (isEx) {
+        var p0 = obj.ToGlobal(NewVector(0, 0, 0));
+        var axX = toTsDir(vSub(obj.ToGlobal(NewVector(1, 0, 0)), p0));
+        var axY = toTsDir(vSub(obj.ToGlobal(NewVector(0, 1, 0)), p0));
+        var axZ = toTsDir(vSub(obj.ToGlobal(NewVector(0, 0, 1)), p0));
+        var loops = extractContourLoops(obj, 0);
+        var innerLoops = loops.length > 1 ? extractContourLoops(obj, -1.0).slice(1) : [];
+        if (loops.length > 0) {
+            return {
+                kind: "extrusion",
+                name: bName,
+                material: matName,
+                outerLoop: loops[0],
+                innerLoops: innerLoops,
+                axX: axX,
+                axY: axY,
+                dir: axZ,
+                length: obj.Thickness * MM_TO_M
+            };
+        }
+        return null;
+    }
+
+    // Case F: TTrajectoryBody (Contour2D + Trajectory2D -> Revolve or Sweep)
+    var isTr = false;
+    try { isTr = !!(obj.Contour2D && obj.Trajectory2D && obj.Contour2D.Count > 0 && obj.Trajectory2D.Count > 0); } catch (e) {}
+    if (isTr) {
+        var profSegs = extract2DSegs(obj.Contour2D);
+        var trajSegs = extract2DSegs(obj.Trajectory2D);
+        if (profSegs.length === 0 || trajSegs.length === 0) return null;
+
+        var tp0 = obj.ToGlobal(NewVector(0, 0, 0));
+        var zAxisTs = toTsDir(vSub(obj.ToGlobal(NewVector(0, 0, 1)), tp0));
+
+        function buildProfileAt(tx, ty, nx, ny) {
+            var lp = map2DLoopWithTransform(profSegs, function(u, v) {
+                return toTsPt(obj.ToGlobal(NewVector(tx + u * nx, ty + u * ny, v)));
+            });
+            var nDir = toTsDir(vSub(obj.ToGlobal(NewVector(nx, ny, 0)), tp0));
+            return { loop: lp, axX: nDir, axY: zAxisTs };
+        }
+
+        if (trajSegs.length === 1 && (trajSegs[0].kind === "circle" || trajSegs[0].kind === "arc")) {
+            var ts0 = trajSegs[0];
+            var cx = ts0.kind === "circle" ? ts0.center.x : ts0.cx;
+            var cy = ts0.kind === "circle" ? ts0.center.y : ts0.cy;
+            var sx = ts0.kind === "circle" ? (cx + ts0.radius) : ts0.p1.x;
+            var sy = ts0.kind === "circle" ? cy : ts0.p1.y;
+            var dirSign = (ts0.kind === "circle" || ts0.da >= 0) ? 1 : -1;
+            var aStart = ts0.kind === "circle" ? 0 : ts0.a1;
+            var tangX = -dirSign * Math.sin(aStart);
+            var tangY = dirSign * Math.cos(aStart);
+            var normX = -tangY;
+            var normY = tangX;
+            var pf = buildProfileAt(sx, sy, normX, normY);
+            return {
+                kind: "revolve",
+                name: bName,
+                material: matName,
+                outerLoop: pf.loop,
+                axX: pf.axX,
+                axY: pf.axY,
+                axisOrigin: toTsPt(obj.ToGlobal(NewVector(cx, cy, 0))),
+                axisDir: { x: zAxisTs.x * dirSign, y: zAxisTs.y * dirSign, z: zAxisTs.z * dirSign },
+                angleRad: ts0.kind === "circle" ? (2 * Math.PI) : Math.abs(ts0.da)
+            };
+        } else {
+            var sweepSegs = [];
+            for (var si = 0; si < trajSegs.length; si++) {
+                var seg = trajSegs[si];
+                if (seg.kind === "line") {
+                    var dx = seg.p2.x - seg.p1.x, dy = seg.p2.y - seg.p1.y;
+                    var len = Math.sqrt(dx * dx + dy * dy);
+                    if (len < 0.1) continue;
+                    var tx = dx / len, ty = dy / len;
+                    var nx = -ty, ny = tx;
+                    var pfL = buildProfileAt(seg.p1.x, seg.p1.y, nx, ny);
+                    var dirTs = toTsDir(vSub(obj.ToGlobal(NewVector(seg.p2.x, seg.p2.y, 0)), obj.ToGlobal(NewVector(seg.p1.x, seg.p1.y, 0))));
+                    sweepSegs.push({
+                        kind: "extrude",
+                        profileLoop: pfL.loop,
+                        axX: pfL.axX,
+                        axY: pfL.axY,
+                        dir: dirTs,
+                        length: len * MM_TO_M
+                    });
+                } else if (seg.kind === "arc") {
+                    var dS = seg.da >= 0 ? 1 : -1;
+                    var tAx = -dS * Math.sin(seg.a1), tAy = dS * Math.cos(seg.a1);
+                    var nAx = -tAy, nAy = tAx;
+                    var pfA = buildProfileAt(seg.p1.x, seg.p1.y, nAx, nAy);
+                    sweepSegs.push({
+                        kind: "revolve",
+                        profileLoop: pfA.loop,
+                        axX: pfA.axX,
+                        axY: pfA.axY,
+                        axisOrigin: toTsPt(obj.ToGlobal(NewVector(seg.cx, seg.cy, 0))),
+                        axisDir: { x: zAxisTs.x * dS, y: zAxisTs.y * dS, z: zAxisTs.z * dS },
+                        angleRad: Math.abs(seg.da)
+                    });
+                }
+            }
+            if (sweepSegs.length > 0) {
+                return {
+                    kind: "sweep",
+                    name: bName,
+                    material: matName,
+                    segments: sweepSegs
+                };
+            }
+        }
+    }
+    return null;
+}
+
+function collectBodies(container, out) {
+    var cnt = 0;
+    try { cnt = container.Count || 0; } catch (e) { cnt = 0; }
+    for (var i = 0; i < cnt; i++) {
+        var obj = container.Objects[i];
+        if (!obj || obj.Visible === false || obj.AsPanel) continue;
+
+        var isFastener = false;
+        try { isFastener = !!(obj.Holes && obj.Holes.Count >= 0); } catch (e) {}
+        if (isFastener) continue;
+
+        // Check TCSGOperation FIRST (it has Count > 0, so handle it before generic container recursion)
+        if (typeof obj.CSGFunction === "number") {
+            var csgBody = extractBody3D(obj, out.length + 1);
+            if (csgBody) out.push(csgBody);
+            continue;
+        }
+
+        var childCount = 0;
+        try { childCount = obj.Count || 0; } catch (e) {}
+        if (childCount > 0) {
+            if (subtreeHasPanel(obj)) {
+                collectBodies(obj, out);
+            }
+            continue;
+        }
+
+        var b = extractBody3D(obj, out.length + 1);
+        if (b) out.push(b);
+    }
+}
+
 function main() {
     var rawPanels = [];
     collectPanels(Model, rawPanels);
-    if (rawPanels.length === 0) {
-        alert("No panels found in the active Bazis model.");
+    var bodies = [];
+    collectBodies(Model, bodies);
+    if (rawPanels.length === 0 && bodies.length === 0) {
+        alert("No panels or 3D bodies found in the active Bazis model.");
         return;
     }
 
@@ -943,6 +1354,7 @@ function main() {
             hardwareLibDir: hwLibDir,
             saveTopPath: saveTopPath,
             panels: panels,
+            bodies: bodies,
             hardware: hardware
         };
         fs.writeFileSync(jsonPath, JSON.stringify(payload), "utf8");

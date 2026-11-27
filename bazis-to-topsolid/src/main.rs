@@ -4,6 +4,8 @@ mod model;
 #[cfg(windows)]
 mod com;
 #[cfg(windows)]
+mod diag_log;
+#[cfg(windows)]
 mod exporter;
 #[cfg(windows)]
 mod win_ui;
@@ -40,6 +42,20 @@ fn main() {
 fn main() {
     win_ui::init_dpi_aware();
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--inspect") {
+        match exporter::inspect_active_document() {
+            Ok(report) => {
+                println!("{}", report);
+                let _ = fs::write(r"Y:\Works\bazis\Scripts\verify_ts6_doc.txt", &report);
+                let _ = fs::write(r"C:\Users\danch\Documents\Bazis\Scripts\verify_ts6_doc.txt", &report);
+            }
+            Err(e) => {
+                eprintln!("ERR|{}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--cli") {
         let json_path = args
             .iter()
@@ -111,7 +127,7 @@ mod win_gui {
     use std::thread;
     use std::time::Instant;
 
-    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
         GetDC, GetDeviceCaps, GetStockObject, ReleaseDC, COLOR_BTNFACE, DEFAULT_GUI_FONT,
         LOGPIXELSX,
@@ -123,14 +139,15 @@ mod win_gui {
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, MessageBoxW,
-        PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer, SetWindowPos,
-        SetWindowTextW, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-        BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL,
-        ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST, HWND_TOPMOST, IDOK, MB_ICONWARNING,
-        MB_OKCANCEL, MB_SETFOREGROUND, MSG, SWP_NOMOVE, SWP_NOSIZE, SW_SHOW, WM_APP, WM_COMMAND,
-        WM_DESTROY, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP,
-        WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, KillTimer,
+        MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW, SetTimer,
+        SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
+        BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON,
+        BS_PUSHBUTTON, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, HWND_NOTOPMOST,
+        HWND_TOPMOST, IDOK, MB_ICONWARNING, MB_OKCANCEL, MB_SETFOREGROUND, MSG, SPI_GETWORKAREA,
+        SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, SW_SHOW, WM_APP, WM_COMMAND, WM_DESTROY, WM_SETFONT,
+        WM_TIMER, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_GROUP, WS_MINIMIZEBOX,
+        WS_OVERLAPPED, WS_SYSMENU, WS_VISIBLE, WS_VSCROLL,
     };
 
     use crate::com::to_wide_null;
@@ -320,8 +337,22 @@ mod win_gui {
             unsafe {
                 EnableWindow(st.hwnd_start, 0);
                 EnableWindow(st.hwnd_stop, 1);
-                // Keep exporter window on top while running so timer, speed meter, and Stop stay reachable
-                SetWindowPos(st.hwnd_main, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                // Un-maximize and dock exporter window in bottom-right corner so it NEVER covers
+                // TopSolid's top menu bar (Assembly -> Use process) or prompt bar!
+                ShowWindow(st.hwnd_main, SW_RESTORE);
+                let mut wa: RECT = std::mem::zeroed();
+                let mut wr: RECT = std::mem::zeroed();
+                if SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut wa as *mut RECT as *mut _, 0) != 0
+                    && GetWindowRect(st.hwnd_main, &mut wr) != 0
+                {
+                    let w = (wr.right - wr.left).max(400);
+                    let h = (wr.bottom - wr.top).max(300);
+                    let x = (wa.right - w - 12).max(wa.left);
+                    let y = (wa.bottom - h - 12).max(wa.top);
+                    SetWindowPos(st.hwnd_main, HWND_TOPMOST, x, y, w, h, 0);
+                } else {
+                    SetWindowPos(st.hwnd_main, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                }
                 SetTimer(st.hwnd_main, ID_TIMER_METRICS, 500, None);
             }
             set_text(st.hwnd_metrics, &format_metrics_line(st));

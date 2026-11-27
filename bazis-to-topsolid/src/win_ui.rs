@@ -5,8 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use crate::diag_log::log_line;
+
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, mouse_event, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
@@ -54,8 +57,14 @@ unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     if IsWindowVisible(hwnd) == 0 {
         return 1;
     }
+    // NEVER match our own exporter window (whose title also contains "TopSolid")!
+    let mut pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == GetCurrentProcessId() {
+        return 1;
+    }
     let title = get_window_text(hwnd);
-    if title.contains("TopSolid") {
+    if title.contains("TopSolid") && !title.contains("Exporter") && !title.contains("MCP") {
         let out = lparam as *mut HWND;
         *out = hwnd;
         return 0;
@@ -88,7 +97,7 @@ unsafe extern "system" fn enum_prompt_text_cb(hwnd: HWND, lparam: LPARAM) -> BOO
     }
     if get_class_name(hwnd) == "Static" {
         let mut r: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 {
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 70 && r.top <= 420 {
             let t = get_window_text(hwnd);
             if !t.is_empty() {
                 let acc = &mut *(lparam as *mut PromptTextAcc);
@@ -122,7 +131,7 @@ unsafe extern "system" fn enum_prompt_btn_cb(hwnd: HWND, lparam: LPARAM) -> BOOL
     }
     if get_class_name(hwnd) == "Button" {
         let mut r: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 && r.right > r.left + 8 {
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 70 && r.top <= 420 && r.right > r.left + 8 {
             let t = get_window_text(hwnd).trim().to_ascii_lowercase();
             let search = &mut *(lparam as *mut ButtonSearch);
             let matched = if search.exact {
@@ -159,7 +168,7 @@ unsafe extern "system" fn enum_edit_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
     }
     if get_class_name(hwnd) == "Edit" {
         let mut r: RECT = std::mem::zeroed();
-        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 150 && r.top <= 360 && r.right > r.left + 8 {
+        if GetWindowRect(hwnd, &mut r) != 0 && r.top >= 70 && r.top <= 420 && r.right > r.left + 8 {
             let out = lparam as *mut HWND;
             *out = hwnd;
             return 0;
@@ -348,14 +357,21 @@ where
     sleep(Duration::from_millis(80));
 
     let total = pairs.len();
-    let mut done = 0usize;
+    let mut processed = 0usize;
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    let mut consec_menu_fail = 0usize;
+    let t_batch = Instant::now();
+    log_line(&format!("PHASE3 START: {} Use process pairs (TopSolid HWND={:?})", total, hwnd));
     for (cmp, panel) in pairs {
+        let t_op = Instant::now();
         if cancel.load(Ordering::Relaxed) {
             tap_vk(0x1B);
-            return Err(format!("Stopped by user after {}/{} operations.", done, total));
+            log_line(&format!("PHASE3 CANCELLED at {}/{} (applied={}, skipped={})", processed, total, applied, skipped));
+            return Err(format!("Stopped by user after {}/{} operations ({} applied).", processed, total, applied));
         }
 
-        // Step 0: Guarantee TopSolid is at "Component to use:" (retry up to 3x on heavy scenes)
+        // Step 0: Guarantee TopSolid is foreground and at "Component to use:" (retry up to 3x on heavy scenes)
         let mut at_comp_prompt = get_prompt_bar_text(hwnd)
             .to_ascii_lowercase()
             .contains("component to use");
@@ -363,6 +379,11 @@ where
             if at_comp_prompt {
                 break;
             }
+            unsafe {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+                SetForegroundWindow(hwnd);
+            }
+            sleep(Duration::from_millis(60));
             let cur = get_prompt_bar_text(hwnd).to_ascii_lowercase();
             if !cur.contains("choose a function") {
                 tap_vk(0x1B);
@@ -382,10 +403,28 @@ where
         }
         if !at_comp_prompt {
             tap_vk(0x1B);
-            done += 1;
-            on_progress(done, total, &format!("Skipped (Use process menu timeout): {} -> {}", cmp, panel));
+            processed += 1;
+            skipped += 1;
+            consec_menu_fail += 1;
+            let seen = get_prompt_bar_text(hwnd);
+            log_line(&format!(
+                "  OP {}/{} {}->{} SKIPPED(menu_timeout) in {}ms | prompt='{}'",
+                processed, total, cmp, panel, t_op.elapsed().as_millis(), seen
+            ));
+            on_progress(
+                processed,
+                total,
+                &format!("Skipped (Use process menu timeout, prompt='{}'): {} -> {}", seen, cmp, panel),
+            );
+            if consec_menu_fail >= 3 {
+                return Err(format!(
+                    "Cannot open Assembly -> Use process in TopSolid (prompt bar: '{}'). Make sure no window covers TopSolid's top menu bar.",
+                    seen
+                ));
+            }
             continue;
         }
+        consec_menu_fail = 0;
 
         // Step 1: Focus the prompt [Edit] box explicitly (heavy scenes steal focus during redraw),
         // clear any leftover text, type component name, press ENTER, and wait for [PROCESS=...] button.
@@ -396,10 +435,16 @@ where
 
         let proc_btn = wait_prompt_button(hwnd, "process=", false, 1800);
         let Some((px, py)) = proc_btn else {
+            let seen = get_prompt_bar_text(hwnd);
             tap_vk(0x1B);
             sleep(Duration::from_millis(80));
-            done += 1;
-            on_progress(done, total, &format!("Skipped (PROCESS button not found): {} -> {}", cmp, panel));
+            processed += 1;
+            skipped += 1;
+            log_line(&format!(
+                "  OP {}/{} {}->{} SKIPPED(no_process_btn) in {}ms | prompt='{}'",
+                processed, total, cmp, panel, t_op.elapsed().as_millis(), seen
+            ));
+            on_progress(processed, total, &format!("Skipped (PROCESS button not found): {} -> {}", cmp, panel));
             continue;
         };
 
@@ -414,10 +459,16 @@ where
             sleep(Duration::from_millis(120));
         }
         if !at_shape_prompt {
+            let seen = get_prompt_bar_text(hwnd);
             tap_vk(0x1B);
             sleep(Duration::from_millis(80));
-            done += 1;
-            on_progress(done, total, &format!("Skipped (Shape prompt not reached): {} -> {}", cmp, panel));
+            processed += 1;
+            skipped += 1;
+            log_line(&format!(
+                "  OP {}/{} {}->{} SKIPPED(no_shape_prompt) in {}ms | btn=({},{}) prompt='{}'",
+                processed, total, cmp, panel, t_op.elapsed().as_millis(), px, py, seen
+            ));
+            on_progress(processed, total, &format!("Skipped (Shape prompt not reached): {} -> {}", cmp, panel));
             continue;
         }
 
@@ -428,23 +479,36 @@ where
         tap_vk(0x0D);
 
         // Step 4: Click [OK] button (or press ENTER) to execute the native TopSolid'Wood operation
-        if let Some((ox, oy)) = wait_prompt_button(hwnd, "ok", true, 1500) {
+        let ok_clicked = if let Some((ox, oy)) = wait_prompt_button(hwnd, "ok", true, 1500) {
             click(ox, oy);
+            true
         } else {
             tap_vk(0x0D);
-        }
+            false
+        };
 
         // Wait dynamically until TopSolid finishes Parasolid operation & returns to "Component to use:"
-        wait_prompt_bar_contains_any(hwnd, &["component to use", "choose a function"], 4000);
+        let returned = wait_prompt_bar_contains_any(hwnd, &["component to use", "choose a function"], 4000);
         sleep(Duration::from_millis(20));
 
-        done += 1;
-        on_progress(done, total, &format!("Use process: {} -> {}", cmp, panel));
+        processed += 1;
+        applied += 1;
+        log_line(&format!(
+            "  OP {}/{} {}->{} OK in {}ms (ok_btn={}, returned={})",
+            processed, total, cmp, panel, t_op.elapsed().as_millis(), ok_clicked, returned
+        ));
+        on_progress(processed, total, &format!("Use process: {} -> {}", cmp, panel));
     }
 
     tap_vk(0x1B);
     sleep(Duration::from_millis(80));
-    Ok(done)
+    log_line(&format!(
+        "PHASE3 END in {:.2}s: applied={}, skipped={}",
+        t_batch.elapsed().as_secs_f64(),
+        applied,
+        skipped
+    ));
+    Ok(applied)
 }
 
 // ============================================================================
