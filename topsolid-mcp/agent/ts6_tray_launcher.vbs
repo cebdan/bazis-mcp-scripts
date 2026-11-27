@@ -20,14 +20,19 @@ If Not fso.FolderExists(appDataDir) Then
 End If
 
 ' Parse arguments: --clear-stop clears manual stop flag (used by Start Menu / .bat)
-Dim extraArgs, i, arg, clearStop
+Dim extraArgs, i, arg, clearStop, isUiAction, argLower
 extraArgs = ""
 clearStop = False
+isUiAction = False
 For i = 0 To WScript.Arguments.Count - 1
     arg = WScript.Arguments.Item(i)
-    If LCase(arg) = "--clear-stop" Then
+    argLower = LCase(arg)
+    If argLower = "--clear-stop" Then
         clearStop = True
     Else
+        If argLower = "-openinfo" Or argLower = "-opensettings" Or argLower = "-checkupdate" Then
+            isUiAction = True
+        End If
         If InStr(arg, " ") > 0 Then
             extraArgs = extraArgs & " """ & arg & """"
         Else
@@ -121,6 +126,12 @@ runArgs = extraArgs
 
 Do
     If ShouldRespectStoppedFlag() Then
+        If isUiAction And runArgs <> "" Then
+            ' Bridge is manually stopped (stopped.flag present): open the requested UI dialog
+            ' in one-shot mode without removing stopped.flag or starting the background bridge.
+            cmd = baseCmd & runArgs & " -OneShotUi"
+            sh.Run cmd, 0, True
+        End If
         WScript.Quit 0
     End If
 

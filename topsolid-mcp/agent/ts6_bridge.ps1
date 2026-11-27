@@ -10,6 +10,7 @@ param(
     [switch]$OpenInfo,
     [switch]$OpenSettings,
     [switch]$CheckUpdate,
+    [switch]$OneShotUi,
     [switch]$InstallService,
     [switch]$UninstallService,
     [switch]$InstallStartMenu,
@@ -54,6 +55,7 @@ $script:ConfigPath = Join-Path $script:AppDataDir "config.json"
 $script:LogPath = Join-Path $script:AppDataDir "bridge.log"
 $script:UiCmdPath = Join-Path $script:AppDataDir "ui-cmd.json"
 $script:StoppedFlagPath = Join-Path $script:AppDataDir "stopped.flag"
+$script:ShortcutsVersionPath = Join-Path $script:AppDataDir "shortcuts.version"
 $script:ExitCode = 0
 $script:TaskName = "TopSolid6McpBridge"
 $script:StartMenuFolder = Join-Path ([Environment]::GetFolderPath("Programs")) "TopSolid MCP"
@@ -765,25 +767,39 @@ function Get-StartMenuStatus {
     return @{ installed = ($exists -and $count -gt 0); folder = $script:StartMenuFolder; shortcutCount = $count }
 }
 
-function New-ShortcutFile([string]$lnkPath, [string]$target, [string]$args, [string]$workDir, [string]$desc, [string]$iconLoc) {
+function New-ShortcutFile([string]$lnkPath, [string]$target, [string]$arguments, [string]$workDir, [string]$desc, [string]$iconLoc) {
     $ws = New-Object -ComObject WScript.Shell
     $sc = $ws.CreateShortcut($lnkPath)
     $sc.TargetPath = $target
-    if ($args) { $sc.Arguments = $args }
+    if ($arguments) { $sc.Arguments = $arguments }
     if ($workDir) { $sc.WorkingDirectory = $workDir }
     if ($desc) { $sc.Description = $desc }
     if ($iconLoc) { $sc.IconLocation = $iconLoc }
     $sc.Save()
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($sc) | Out-Null
+
+    # Read back saved shortcut to verify TargetPath and Arguments
+    $chk = $ws.CreateShortcut($lnkPath)
+    $actualTarget = [string]$chk.TargetPath
+    $actualArgs   = [string]$chk.Arguments
+    $expectedArgs = if ($arguments) { [string]$arguments } else { "" }
+    $targetMatch  = ($actualTarget -ieq $target) -or ((Split-Path -Leaf $actualTarget) -ieq (Split-Path -Leaf $target))
+    if ((-not $targetMatch) -or ($actualArgs -ne $expectedArgs)) {
+        Write-BridgeLog "Shortcut verification mismatch for '$(Split-Path -Leaf $lnkPath)': Target='$actualTarget' (expected '$target'), Arguments='$actualArgs' (expected '$expectedArgs')" "WARN"
+    }
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($chk) | Out-Null
     [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws) | Out-Null
 }
 
 function Install-StartMenuShortcuts {
-    if (-not (Test-Path $script:StartMenuFolder)) {
+    if (Test-Path $script:StartMenuFolder) {
+        Get-ChildItem -Path $script:StartMenuFolder -Filter "*.lnk" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    } else {
         New-Item -ItemType Directory -Path $script:StartMenuFolder -Force | Out-Null
     }
     $ico = if (Test-Path $script:IconFile) { "$($script:IconFile),0" } else { "shell32.dll,21" }
     $wscript = Join-Path $env:WINDIR "System32\wscript.exe"
+    $explorer = Join-Path $env:WINDIR "explorer.exe"
     $installBat = Join-Path $script:RepoRoot "Install_TopSolid6_MCP.bat"
     $uninstallBat = Join-Path $script:RepoRoot "Uninstall_TopSolid6_MCP.bat"
 
@@ -810,7 +826,7 @@ function Install-StartMenuShortcuts {
     }
 
     New-ShortcutFile (Join-Path $script:StartMenuFolder "Open IPC & Logs Folder.lnk") `
-        "explorer.exe" ("`"" + $script:IpcDir + "`"") $script:IpcDir `
+        $explorer ("`"" + $script:IpcDir + "`"") $script:IpcDir `
         "Open TopSolid MCP IPC folder" "shell32.dll,3"
 
     if (Test-Path $uninstallBat) {
@@ -819,6 +835,10 @@ function Install-StartMenuShortcuts {
             "Uninstall TopSolid MCP Service and Start Menu shortcuts" "shell32.dll,131"
     }
 
+    try {
+        [System.IO.File]::WriteAllText($script:ShortcutsVersionPath, $script:AppVersion, $script:Utf8NoBom)
+    } catch {}
+
     Write-BridgeLog "Created Start Menu section at '$($script:StartMenuFolder)'."
 }
 
@@ -826,6 +846,52 @@ function Uninstall-StartMenuShortcuts {
     if (Test-Path $script:StartMenuFolder) {
         Remove-Item -Path $script:StartMenuFolder -Recurse -Force -ErrorAction SilentlyContinue
         Write-BridgeLog "Removed Start Menu section '$($script:StartMenuFolder)'."
+    }
+    if (Test-Path $script:ShortcutsVersionPath) {
+        Remove-Item -Path $script:ShortcutsVersionPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Repair-StartMenuShortcutsIfNeeded {
+    if (-not (Test-Path $script:StartMenuFolder)) { return }
+    $reasons = New-Object System.Collections.Generic.List[string]
+
+    $bridgeLnk = Join-Path $script:StartMenuFolder "TopSolid MCP Bridge.lnk"
+    if (-not (Test-Path $bridgeLnk)) {
+        $reasons.Add("Bridge shortcut missing")
+    } else {
+        try {
+            $ws = New-Object -ComObject WScript.Shell
+            $sc = $ws.CreateShortcut($bridgeLnk)
+            $lnkArgs = [string]$sc.Arguments
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($sc) | Out-Null
+            [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ws) | Out-Null
+            if ([string]::IsNullOrWhiteSpace($lnkArgs)) {
+                $reasons.Add("empty Bridge shortcut Arguments")
+            }
+        } catch {
+            $reasons.Add("unreadable Bridge shortcut")
+        }
+    }
+
+    $savedVer = ""
+    if (Test-Path $script:ShortcutsVersionPath) {
+        try {
+            $savedVer = ([System.IO.File]::ReadAllText($script:ShortcutsVersionPath, [System.Text.Encoding]::UTF8)).Trim()
+        } catch {}
+    }
+    if ($savedVer -ne $script:AppVersion) {
+        $verLabel = if ($savedVer) { $savedVer } else { "none" }
+        $reasons.Add("version $verLabel -> $($script:AppVersion)")
+    }
+
+    if ($reasons.Count -gt 0) {
+        try {
+            Install-StartMenuShortcuts
+            Write-BridgeLog "Start Menu shortcuts repaired (reason: $($reasons -join '; '))."
+        } catch {
+            Write-BridgeLog "Failed to repair Start Menu shortcuts: $($_.Exception.Message)" "WARN"
+        }
     }
 }
 
@@ -862,6 +928,14 @@ if (-not $NoTray) {
             [System.IO.File]::WriteAllText($script:UiCmdPath, $cmdJson, $script:Utf8NoBom)
         }
         exit 3
+    }
+    if ($OneShotUi) {
+        # Do not hold bridge mutex during one-shot UI display so user can start the bridge anytime
+        try { $script:Mutex.ReleaseMutex() } catch {}
+        $script:Mutex.Dispose()
+        $script:Mutex = $null
+    } else {
+        Repair-StartMenuShortcutsIfNeeded
     }
 }
 
@@ -1548,13 +1622,18 @@ function Show-UpdateCheckDialog([bool]$silentIfUpToDate = $false) {
         if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
             $upd = Invoke-GitHubUpdate
             if ($upd.ok) {
+                $doneMsg = if ($OneShotUi) {
+                    "$($upd.message)`r`n`r`nStart TopSolid MCP Bridge from Start Menu when ready."
+                } else {
+                    "$($upd.message)`r`n`r`nThe bridge will now restart to apply the update."
+                }
                 [System.Windows.Forms.MessageBox]::Show(
-                    "$($upd.message)`r`n`r`nThe bridge will now restart to apply the update.",
+                    $doneMsg,
                     "TopSolid MCP - Update Complete",
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information
                 ) | Out-Null
-                Restart-BridgeProcess
+                if (-not $OneShotUi) { Restart-BridgeProcess }
             } else {
                 [System.Windows.Forms.MessageBox]::Show(
                     "Update failed:`r`n$($upd.message)",
@@ -2263,9 +2342,13 @@ function Show-SettingsWindow {
         $script:TemplatesDir = $script:Config.templatesDir
         if (-not (Test-Path $script:IpcDir)) { New-Item -ItemType Directory -Path $script:IpcDir -Force | Out-Null }
         if ($script:IpcTimer) { $script:IpcTimer.Interval = $script:Config.pollIntervalMs }
-        Start-HttpGateway
+        if (-not $OneShotUi) {
+            Start-HttpGateway
+        }
         Write-BridgeLog "Settings saved and applied (poll=$($script:Config.pollIntervalMs)ms, httpEnabled=$($script:Config.httpEnabled), port=$($script:Config.httpPort))."
-        Show-TrayBalloon "Settings Saved" "Bridge & HTTP gateway configuration updated." "Info"
+        if (-not $OneShotUi) {
+            Show-TrayBalloon "Settings Saved" "Bridge & HTTP gateway configuration updated." "Info"
+        }
         if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) { $script:SettingsForm.Close() }
     })
     $form.Controls.Add($btnSave)
@@ -2307,6 +2390,26 @@ function Show-SettingsWindow {
         $script:SettingsUI = $null
     })
     $form.Show()
+}
+
+# ============================================================================
+# One-Shot UI Mode (when bridge is stopped via stopped.flag)
+# ============================================================================
+if ($OneShotUi) {
+    if ($OpenSettings) {
+        Show-SettingsWindow
+        if ($null -ne $script:SettingsForm -and -not $script:SettingsForm.IsDisposed) {
+            [System.Windows.Forms.Application]::Run($script:SettingsForm)
+        }
+    } elseif ($CheckUpdate) {
+        Show-UpdateCheckDialog $false
+    } else {
+        Show-InfoWindow
+        if ($null -ne $script:InfoForm -and -not $script:InfoForm.IsDisposed) {
+            [System.Windows.Forms.Application]::Run($script:InfoForm)
+        }
+    }
+    exit 0
 }
 
 # ============================================================================

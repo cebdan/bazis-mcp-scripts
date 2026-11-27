@@ -54,7 +54,7 @@ mod win_setup {
     const CB_ADDSTRING: u32 = 0x0143;
     const CB_SETCURSEL: u32 = 0x014E;
 
-    const APP_VERSION: &str = "0.3.2";
+    const APP_VERSION: &str = "0.3.3";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Embedded payload files from topsolid-mcp/
@@ -434,7 +434,7 @@ mod win_setup {
             on_progress(94, "Starting TopSolid MCP Bridge in System Tray...");
             let vbs = opts.install_dir.join("agent").join("ts6_tray_launcher.vbs");
             let _ = Command::new("wscript.exe")
-                .args(["//B", &vbs.to_string_lossy()])
+                .args(["//B", &vbs.to_string_lossy(), "--clear-stop"])
                 .current_dir(&opts.install_dir)
                 .creation_flags(CREATE_NO_WINDOW)
                 .stdout(Stdio::null())

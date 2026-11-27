@@ -1,8 +1,8 @@
 {
   "name": "topsolid-mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "released": "2026-11-27",
   "repo": "cebdan/bazis-mcp-scripts",
   "branch": "main",
-  "changelog": "Bridge auto-restart: supervising launcher with exit codes, 5-min safety trigger, manual-stop flag."
+  "changelog": "Fix Start Menu shortcuts (empty arguments due to $args), self-repair shortcuts on startup."
 }
