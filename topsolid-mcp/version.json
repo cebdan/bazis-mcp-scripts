@@ -1,8 +1,8 @@
 {
   "name": "topsolid-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "released": "2026-11-27",
   "repo": "cebdan/bazis-mcp-scripts",
   "branch": "main",
-  "changelog": "Network MCP (Streamable HTTP) on Windows, bearer auth, stdio->HTTP proxy, stale IPC request guard."
+  "changelog": "Gateway supervision: adopt/kill orphan gateway, parent watchdog, backoff, VPN-free primary URL."
 }

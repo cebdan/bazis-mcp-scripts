@@ -54,7 +54,7 @@ mod win_setup {
     const CB_ADDSTRING: u32 = 0x0143;
     const CB_SETCURSEL: u32 = 0x014E;
 
-    const APP_VERSION: &str = "0.3.0";
+    const APP_VERSION: &str = "0.3.1";
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Embedded payload files from topsolid-mcp/

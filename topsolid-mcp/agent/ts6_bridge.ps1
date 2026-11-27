@@ -1,4 +1,4 @@
-# TopSolid MCP Bridge & System Tray App (Zero-dependency Windows PowerShell 5.1)
+﻿# TopSolid MCP Bridge & System Tray App (Zero-dependency Windows PowerShell 5.1)
 # Watches <repo>\.ts6-ipc\ for atomic JSON request files and executes COM commands
 # against TopSolid.Application via cscript.exe (isolated per request).
 # Features: System Tray icon (left-click Info, right-click Settings/Menu),
@@ -228,30 +228,203 @@ try {
     Get-ChildItem -Path $script:IpcDir -Filter "res-*.json" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
 } catch {}
 
-# HTTP MCP Gateway process state & watchdog
+# HTTP MCP Gateway process state & supervisor
+$script:HttpPidPath = Join-Path $script:AppDataDir "http.pid"
 $script:HttpProc = $null
+$script:HttpMode = "down"          # owned | adopted | down | blocked
+$script:HttpBlockedPid = 0
 $script:HttpLastError = ""
-$script:HttpRestartTimes = New-Object System.Collections.Generic.List[DateTime]
-$script:HttpNextRestartAt = [DateTime]::MinValue
+$script:HttpBackoffSec = 3
+$script:HttpNextCheckAt = [DateTime]::MinValue
+$script:HttpStartedAt = [DateTime]::MinValue
+$script:HttpLastLogMsg = ""
+$script:HttpLastLogAt = [DateTime]::MinValue
+$script:HttpHealthCacheVal = $false
+$script:HttpHealthCacheAt = [DateTime]::MinValue
+$script:HttpHealthCachePid = 0
+
+function Write-HttpStateLog([string]$msg, [string]$level = "INFO") {
+    $now = Get-Date
+    if ($msg -eq $script:HttpLastLogMsg -and (($now - $script:HttpLastLogAt).TotalSeconds -lt 300)) {
+        return
+    }
+    $script:HttpLastLogMsg = $msg
+    $script:HttpLastLogAt = $now
+    Write-BridgeLog $msg $level
+}
+
+function Get-ExpectedHttpCfgHash {
+    $raw = "$($script:IpcDir)|$([int]$script:Config.httpPort)|$($script:Config.httpToken)|$(@($script:Config.httpAllowFrom) -join ',')"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+        $hash = $sha.ComputeHash($bytes)
+        return ([BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant().Substring(0, 12))
+    } finally {
+        $sha.Dispose()
+    }
+}
 
 function Get-LocalIPv4List {
-    $ips = New-Object System.Collections.Generic.List[string]
+    $vpnPattern = 'Mullvad|WireGuard|Wintun|TAP|OpenVPN|Tailscale|ZeroTier'
+    $profileByAlias = @{}
+    $profileByIndex = @{}
+    try {
+        foreach ($prof in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+            $cat = [string]$prof.NetworkCategory
+            if ($prof.InterfaceAlias) { $profileByAlias[$prof.InterfaceAlias] = $cat }
+            if ($null -ne $prof.InterfaceIndex) { $profileByIndex[[int]$prof.InterfaceIndex] = $cat }
+        }
+    } catch {}
+
+    $scored = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
     try {
         foreach ($ni in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
             if ($ni.OperationalStatus -ne [System.Net.NetworkInformation.OperationalStatus]::Up) { continue }
             if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Loopback) { continue }
-            foreach ($ua in $ni.GetIPProperties().UnicastAddresses) {
-                if ($ua.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
-                    $s = $ua.Address.IPAddressToString
-                    if ($s -and -not $s.StartsWith("169.254.") -and -not $ips.Contains($s)) {
-                        $ips.Add($s)
-                    }
+            if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Tunnel) { continue }
+            if ($ni.NetworkInterfaceType -eq [System.Net.NetworkInformation.NetworkInterfaceType]::Ppp) { continue }
+            if ($ni.Name -match $vpnPattern -or $ni.Description -match $vpnPattern) { continue }
+
+            $ipProps = $ni.GetIPProperties()
+            $ifIdx = -1
+            try { $ifIdx = [int]$ipProps.GetIPv4Properties().Index } catch {}
+            $cat = "Public"
+            if ($ifIdx -ge 0 -and $profileByIndex.ContainsKey($ifIdx)) {
+                $cat = $profileByIndex[$ifIdx]
+            } elseif ($profileByAlias.ContainsKey($ni.Name)) {
+                $cat = $profileByAlias[$ni.Name]
+            }
+            $isPrivDomain = ($cat -eq "Private" -or $cat -eq "DomainAuthenticated")
+
+            foreach ($ua in $ipProps.UnicastAddresses) {
+                if ($ua.Address.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { continue }
+                $ip = $ua.Address.IPAddressToString
+                if (-not $ip -or $ip.StartsWith("169.254.") -or $ip -eq "127.0.0.1") { continue }
+                if ($seen.ContainsKey($ip)) { continue }
+                $seen[$ip] = $true
+
+                $prio = if ($isPrivDomain) {
+                    if ($ip.StartsWith("10.211.55.")) { 10 }
+                    elseif ($ip.StartsWith("10.37.129.")) { 20 }
+                    elseif ($ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)') { 30 }
+                    else { 40 }
+                } else {
+                    if ($ip.StartsWith("10.211.55.")) { 60 }
+                    elseif ($ip.StartsWith("10.37.129.")) { 70 }
+                    else { 80 }
                 }
+                $scored.Add([PSCustomObject]@{ ip = $ip; prio = $prio })
             }
         }
     } catch {}
-    if (-not $ips.Contains("127.0.0.1")) { $ips.Add("127.0.0.1") }
-    return @($ips)
+
+    $result = New-Object System.Collections.Generic.List[string]
+    foreach ($it in ($scored | Sort-Object -Property prio, ip)) {
+        $result.Add([string]$it.ip)
+    }
+    $result.Add("127.0.0.1")
+    return @($result)
+}
+
+function Probe-LocalHttpHealthz([int]$port, [bool]$force = $false) {
+    $now = Get-Date
+    if (-not $force -and (($now - $script:HttpHealthCacheAt).TotalSeconds -lt 5)) {
+        return @{ ok = $script:HttpHealthCacheVal; pid = $script:HttpHealthCachePid; cfgHash = "" }
+    }
+    $script:HttpHealthCacheAt = $now
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$port/healthz")
+        $req.Method = "GET"
+        $req.Timeout = 1000
+        $req.ReadWriteTimeout = 1000
+        $resp = $req.GetResponse()
+        try {
+            $status = [int]$resp.StatusCode
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $body = $sr.ReadToEnd()
+            $sr.Dispose()
+            if ($status -eq 200) {
+                $obj = $null
+                try { $obj = $body | ConvertFrom-Json } catch {}
+                $rPid = if ($obj -and $obj.pid) { [int]$obj.pid } else { 0 }
+                $rHash = if ($obj -and $obj.cfgHash) { [string]$obj.cfgHash } else { "" }
+                $script:HttpHealthCacheVal = $true
+                $script:HttpHealthCachePid = $rPid
+                return @{ ok = $true; pid = $rPid; cfgHash = $rHash }
+            }
+        } finally {
+            $resp.Close()
+        }
+    } catch {}
+    $script:HttpHealthCacheVal = $false
+    $script:HttpHealthCachePid = 0
+    return @{ ok = $false; pid = 0; cfgHash = "" }
+}
+
+function Get-PortListenerInfo([int]$port) {
+    try {
+        $conn = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($conn -and $conn.OwningProcess -gt 0) {
+            $ownerPid = [int]$conn.OwningProcess
+            $pName = "unknown"
+            $cmdLine = ""
+            try {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$ownerPid" -ErrorAction SilentlyContinue
+                if ($cim) {
+                    $pName = [string]$cim.Name
+                    $cmdLine = [string]$cim.CommandLine
+                } else {
+                    $gp = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                    if ($gp) { $pName = $gp.ProcessName }
+                }
+            } catch {}
+            return @{ pid = $ownerPid; name = $pName; commandLine = $cmdLine }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-IsOurGatewayProcess($listener, [int]$pidFilePid) {
+    if (-not $listener) { return $false }
+    if ($pidFilePid -gt 0 -and $listener.pid -eq $pidFilePid) { return $true }
+    if ($listener.name -match '^node(\.exe)?$' -and $listener.commandLine -like '*index.mjs*--http*') { return $true }
+    return $false
+}
+
+function Try-KillProcess([int]$targetPid) {
+    if ($targetPid -le 0) { return @{ ok = $true; error = "" } }
+    $errMsg = ""
+    try {
+        Stop-Process -Id $targetPid -Force -ErrorAction Stop
+        Start-Sleep -Milliseconds 300
+        if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+            return @{ ok = $true; error = "" }
+        }
+    } catch {
+        $errMsg = $_.Exception.Message
+    }
+    try {
+        $tkOut = (& taskkill.exe /PID $targetPid /T /F 2>&1) -join " "
+        Start-Sleep -Milliseconds 300
+        if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+            return @{ ok = $true; error = "" }
+        }
+        if ($tkOut) { $errMsg = "$errMsg | taskkill: $tkOut".Trim(" |") }
+    } catch {
+        $errMsg = "$errMsg | $($_.Exception.Message)".Trim(" |")
+    }
+    return @{ ok = $false; error = $errMsg }
+}
+
+function Read-HttpPidFile {
+    try {
+        if (Test-Path $script:HttpPidPath) {
+            return ([System.IO.File]::ReadAllText($script:HttpPidPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+        }
+    } catch {}
+    return $null
 }
 
 function Get-HttpGatewayStatus {
@@ -259,11 +432,17 @@ function Get-HttpGatewayStatus {
     $ips = Get-LocalIPv4List
     $urls = @($ips | ForEach-Object { "http://$($_):$port/mcp" })
     $primary = if ($urls.Count -gt 0) { $urls[0] } else { "http://127.0.0.1:$port/mcp" }
-    $running = ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited)
-    $hpid = if ($running) { $script:HttpProc.Id } else { 0 }
+    $probe = if ($script:Config.httpEnabled) { Probe-LocalHttpHealthz $port $false } else { @{ ok = $false; pid = 0 } }
+    $hpid = 0
+    if ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited) {
+        $hpid = $script:HttpProc.Id
+    } elseif ($probe.ok -and $probe.pid -gt 0) {
+        $hpid = $probe.pid
+    }
     return @{
         enabled   = [bool]$script:Config.httpEnabled
-        listening = $running
+        listening = [bool]$probe.ok
+        mode      = $script:HttpMode
         url       = $primary
         urls      = $urls
         pid       = $hpid
@@ -273,8 +452,9 @@ function Get-HttpGatewayStatus {
 
 function Stop-HttpGateway {
     if ($null -ne $script:HttpProc) {
+        $wasAdopted = ($script:HttpMode -eq "adopted")
         try {
-            if (-not $script:HttpProc.HasExited) {
+            if (-not $wasAdopted -and -not $script:HttpProc.HasExited) {
                 $script:HttpProc.Kill()
                 $script:HttpProc.WaitForExit(2000) | Out-Null
             }
@@ -282,24 +462,79 @@ function Stop-HttpGateway {
         try { $script:HttpProc.Dispose() } catch {}
         $script:HttpProc = $null
     }
+    $script:HttpMode = "down"
+    $script:HttpHealthCacheAt = [DateTime]::MinValue
 }
 
 function Start-HttpGateway {
     Stop-HttpGateway
     $script:HttpLastError = ""
-    if (-not $script:Config.httpEnabled) { return }
-    # Clean up any orphaned HTTP gateway process from a previous abrupt exit
-    try {
-        Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue | Where-Object {
-            $_.CommandLine -like "*server*index.mjs*--http*"
-        } | ForEach-Object {
-            try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+    $script:HttpBlockedPid = 0
+    if (-not $script:Config.httpEnabled) {
+        $script:HttpMode = "down"
+        return
+    }
+
+    $port = [int]$script:Config.httpPort
+    $expectedHash = Get-ExpectedHttpCfgHash
+    $pidMeta = Read-HttpPidFile
+    $pidFilePid = if ($pidMeta -and $pidMeta.pid) { [int]$pidMeta.pid } else { 0 }
+
+    # Check if port is already occupied (or http.pid points to a live gateway)
+    $listener = Get-PortListenerInfo $port
+    if (-not $listener -and $pidFilePid -gt 0) {
+        $gp = Get-Process -Id $pidFilePid -ErrorAction SilentlyContinue
+        if ($gp -and $gp.ProcessName -match '^node$') {
+            $listener = @{ pid = $pidFilePid; name = "node.exe"; commandLine = "index.mjs --http" }
         }
-    } catch {}
+    }
+
+    if ($listener) {
+        $ownerPid = [int]$listener.pid
+        if (Test-IsOurGatewayProcess $listener $pidFilePid) {
+            $killRes = Try-KillProcess $ownerPid
+            if ($killRes.ok) {
+                Write-BridgeLog "Stopped previous/orphan HTTP gateway PID=$ownerPid."
+            } else {
+                Write-HttpStateLog "Orphan gateway PID=$ownerPid kill failed: $($killRes.error)" "WARN"
+                $probe = Probe-LocalHttpHealthz $port $true
+                if ($probe.ok -and $probe.cfgHash -and ($probe.cfgHash -eq $expectedHash)) {
+                    try { $script:HttpProc = Get-Process -Id $ownerPid -ErrorAction Stop } catch { $script:HttpProc = $null }
+                    $script:HttpMode = "adopted"
+                    $script:HttpLastError = ""
+                    $script:HttpStartedAt = Get-Date
+                    $script:HttpBackoffSec = 3
+                    Write-HttpStateLog "Adopted existing gateway PID=$ownerPid (cfgHash=$($probe.cfgHash))." "INFO"
+                    return
+                } else {
+                    $script:HttpMode = "blocked"
+                    $script:HttpBlockedPid = $ownerPid
+                    $script:HttpLastError = "Port $port busy by PID $ownerPid (stale config, needs elevated kill)"
+                    Write-HttpStateLog $script:HttpLastError "WARN"
+                    if (-not $NoTray) {
+                        Show-TrayBalloon "HTTP Gateway Blocked" "Port $port is held by stale gateway PID $ownerPid. Right-click tray -> Kill stale gateway (admin)." "Warning"
+                    }
+                    $script:HttpNextCheckAt = (Get-Date).AddSeconds($script:HttpBackoffSec)
+                    $script:HttpBackoffSec = [Math]::Min(300, $script:HttpBackoffSec * 2)
+                    return
+                }
+            }
+        } else {
+            $script:HttpMode = "blocked"
+            $script:HttpBlockedPid = $ownerPid
+            $script:HttpLastError = "Port $port in use by $($listener.name) PID $ownerPid"
+            Write-HttpStateLog $script:HttpLastError "WARN"
+            $script:HttpNextCheckAt = (Get-Date).AddSeconds($script:HttpBackoffSec)
+            $script:HttpBackoffSec = [Math]::Min(300, $script:HttpBackoffSec * 2)
+            return
+        }
+    }
+
     $serverEntry = Join-Path $script:RepoRoot "server\index.mjs"
     if (-not (Test-Path $serverEntry)) {
+        $script:HttpMode = "down"
         $script:HttpLastError = "server/index.mjs not found at $serverEntry"
-        Write-BridgeLog "HTTP Gateway: $($script:HttpLastError)" "ERROR"
+        Write-HttpStateLog "HTTP Gateway: $($script:HttpLastError)" "ERROR"
         return
     }
     $nodeBin = Resolve-NodeExe $script:Config.nodeExe
@@ -317,32 +552,51 @@ function Start-HttpGateway {
         $psi.EnvironmentVariables["TS6_HTTP_ALLOW_FROM"] = (@($script:Config.httpAllowFrom) -join ",")
         $psi.EnvironmentVariables["TS6_LOG_PATH"] = $script:LogPath
         $psi.EnvironmentVariables["TS6_CONFIG_PATH"] = $script:ConfigPath
+        $psi.EnvironmentVariables["TS6_PARENT_PID"] = [string]$PID
         $script:HttpProc = [System.Diagnostics.Process]::Start($psi)
-        Write-BridgeLog "HTTP MCP Gateway started (PID=$($script:HttpProc.Id), http://$($script:Config.httpHost):$($script:Config.httpPort)/mcp, IPC=$($script:IpcDir))."
+        $script:HttpMode = "owned"
+        $script:HttpStartedAt = Get-Date
+        $script:HttpHealthCacheAt = [DateTime]::MinValue
+        Write-BridgeLog "HTTP MCP Gateway started (PID=$($script:HttpProc.Id), http://$($script:Config.httpHost):$port/mcp, IPC=$($script:IpcDir))."
     } catch {
+        $script:HttpMode = "down"
         $script:HttpLastError = $_.Exception.Message
-        Write-BridgeLog "HTTP Gateway start failed: $($script:HttpLastError)" "ERROR"
+        Write-HttpStateLog "HTTP Gateway start failed: $($script:HttpLastError)" "ERROR"
+        $script:HttpNextCheckAt = (Get-Date).AddSeconds($script:HttpBackoffSec)
+        $script:HttpBackoffSec = [Math]::Min(300, $script:HttpBackoffSec * 2)
     }
 }
 
 function Ensure-HttpGatewayAlive {
     if (-not $script:Config.httpEnabled) { return }
-    if ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited) { return }
     $now = Get-Date
-    if ($now -lt $script:HttpNextRestartAt) { return }
-    # Cap restarts at 5 per minute
-    for ($i = $script:HttpRestartTimes.Count - 1; $i -ge 0; $i--) {
-        if (($now - $script:HttpRestartTimes[$i]).TotalSeconds -gt 60) {
-            $script:HttpRestartTimes.RemoveAt($i)
+
+    if ($null -ne $script:HttpProc -and -not $script:HttpProc.HasExited) {
+        if ($script:HttpBackoffSec -gt 3 -and (($now - $script:HttpStartedAt).TotalSeconds -ge 60)) {
+            $script:HttpBackoffSec = 3
         }
-    }
-    if ($script:HttpRestartTimes.Count -ge 5) {
-        $script:HttpLastError = "Restart rate limit reached (5/min)"
         return
     }
-    $script:HttpRestartTimes.Add($now)
-    $script:HttpNextRestartAt = $now.AddSeconds(3)
-    Write-BridgeLog "HTTP Gateway exited; restarting..." "WARN"
+
+    # If our process just exited with code 98 (EADDRINUSE), run port-occupied logic immediately
+    if ($null -ne $script:HttpProc -and $script:HttpProc.HasExited) {
+        $exitCode = 0
+        try { $exitCode = [int]$script:HttpProc.ExitCode } catch {}
+        try { $script:HttpProc.Dispose() } catch {}
+        $script:HttpProc = $null
+        $script:HttpMode = "down"
+        if ($exitCode -eq 98) {
+            Start-HttpGateway
+            return
+        }
+        Write-HttpStateLog "HTTP Gateway exited (code=$exitCode); will restart in $($script:HttpBackoffSec)s." "WARN"
+        $script:HttpNextCheckAt = $now.AddSeconds($script:HttpBackoffSec)
+        $script:HttpBackoffSec = [Math]::Min(300, $script:HttpBackoffSec * 2)
+        return
+    }
+
+    # Mode is down or blocked — re-check when backoff timer expires
+    if ($now -lt $script:HttpNextCheckAt) { return }
     Start-HttpGateway
 }
 
@@ -1054,7 +1308,13 @@ function Process-IpcQueue {
         $cmdName = "unknown"
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         try {
-            $raw = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+            $raw = ""
+            try {
+                $raw = [System.IO.File]::ReadAllText($f.FullName, [System.Text.Encoding]::UTF8)
+            } catch [System.IO.IOException] {
+                # File is still being written by another process; retry on next poll without error
+                continue
+            }
             Remove-Item $f.FullName -Force -ErrorAction SilentlyContinue
             $req = $raw | ConvertFrom-Json
             $cmdName = [string]$req.cmd
@@ -1337,9 +1597,9 @@ function Update-InfoWindowUI([bool]$probeCom = $false) {
     $httpStr = if (-not $httpSt.enabled) {
         "Disabled"
     } elseif ($httpSt.listening) {
-        "LISTENING (PID $($httpSt.pid)) | $($httpSt.urls -join ', ')"
+        "LISTENING ($($httpSt.mode), PID $($httpSt.pid)) | $($httpSt.url)"
     } else {
-        "STOPPED ($($httpSt.lastError))"
+        "$($httpSt.mode.ToUpperInvariant()) ($($httpSt.lastError))"
     }
 
     $lines = @(
@@ -2070,6 +2330,29 @@ $miStartMenu.Add_Click({
     }
 })
 
+$miKillStale = New-Object System.Windows.Forms.ToolStripMenuItem("Kill stale gateway (admin)")
+$miKillStale.Visible = $false
+$miKillStale.Add_Click({
+    $targetPid = $script:HttpBlockedPid
+    if ($targetPid -le 0) {
+        $li = Get-PortListenerInfo ([int]$script:Config.httpPort)
+        if ($li) { $targetPid = [int]$li.pid }
+    }
+    if ($targetPid -le 0) {
+        Show-TrayBalloon "HTTP Gateway" "No blocking process found on port $($script:Config.httpPort)." "Info"
+        return
+    }
+    try {
+        Start-Process -FilePath "taskkill.exe" -ArgumentList "/PID $targetPid /T /F" -Verb RunAs -Wait
+        $script:HttpBackoffSec = 3
+        $script:HttpNextCheckAt = [DateTime]::MinValue
+        Start-HttpGateway
+        Show-TrayBalloon "Stale Gateway Killed" "Terminated PID $targetPid and restarted HTTP gateway." "Info"
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Elevated kill failed: $($_.Exception.Message)", "Kill Stale Gateway", "OK", "Error") | Out-Null
+    }
+})
+
 $miOpenIpc = New-Object System.Windows.Forms.ToolStripMenuItem("Open IPC Folder")
 $miOpenIpc.Add_Click({ Start-Process "explorer.exe" $script:IpcDir })
 
@@ -2095,6 +2378,11 @@ $menu.Add_Opening({
     $sm = Get-StartMenuStatus
     $miStartMenu.Checked = [bool]$sm.installed
     $miStartMenu.Text = if ($sm.installed) { "Start Menu Installed (click to remove)" } else { "Add Start Menu Section" }
+
+    $miKillStale.Visible = ($script:HttpMode -eq "blocked" -and $script:HttpBlockedPid -gt 0)
+    if ($miKillStale.Visible) {
+        $miKillStale.Text = "Kill stale gateway PID $($script:HttpBlockedPid) (admin)"
+    }
 })
 
 [void]$menu.Items.Add($miSettings)
@@ -2102,6 +2390,7 @@ $menu.Add_Opening({
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 [void]$menu.Items.Add($miPause)
 [void]$menu.Items.Add($miRestart)
+[void]$menu.Items.Add($miKillStale)
 [void]$menu.Items.Add($miRebuildTpl)
 [void]$menu.Items.Add($miUpdate)
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))

@@ -112,4 +112,5 @@ claude mcp add --transport http --scope user topsolid6 http://127.0.0.1:8765/mcp
 ## Troubleshooting
 - **Mac cannot reach Windows port 8765:** check `ping <IP VM>`; ensure Windows network profile is **Private** (`Get-NetConnectionProfile`); verify the firewall rule; check `netstat -ano | findstr 8765`.
 - **`/healthz` returns 200 OK, but `tools/call` times out:** the Windows tray bridge is not running/paused, or the HTTP gateway and bridge are using different `ipcDir` paths (`ts6_bridge_info` `ipcDir` must match `TS6_IPC_DIR`).
+- **`EADDRINUSE` / orphan gateway (`mode: blocked`):** if an elevated previous gateway holds port `8765` with an old config/token, right-click the system tray icon and choose **Kill stale gateway (admin)** to terminate it with elevation and restart the gateway cleanly. If its `cfgHash` matches the current config, the bridge automatically adopts it (`mode: adopted`).
 - **Parallels VM IP changes after VM recreate:** assign a DHCP reservation in Parallels Settings → Network or set a static IPv4 address in Windows.

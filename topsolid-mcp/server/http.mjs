@@ -66,6 +66,11 @@ function resolveOrGenerateToken(cfgPath, cfg) {
   return { token, generated: true };
 }
 
+export function computeCfgHash(ipcDir, port, token, allowFrom) {
+  const raw = `${ipcDir}|${port}|${token}|${allowFrom.join(",")}`;
+  return crypto.createHash("sha256").update(raw, "utf8").digest("hex").slice(0, 12);
+}
+
 function parseIpv4(ip) {
   const parts = ip.split(".");
   if (parts.length !== 4) return null;
@@ -173,6 +178,7 @@ function writeLogLine(logPath, line) {
 
 export function startHttpServer(cliOpts = {}) {
   const cfgPath = getDefaultConfigPath();
+  const pidPath = path.join(path.dirname(cfgPath), "http.pid");
   const cfg = loadConfigFile(cfgPath);
   const logPath = getDefaultLogPath();
 
@@ -188,6 +194,41 @@ export function startHttpServer(cliOpts = {}) {
   }
 
   const { token, generated } = resolveOrGenerateToken(cfgPath, cfg);
+  const cfgHash = computeCfgHash(ipcDir, port, token, allowFrom);
+
+  let pidFileWritten = false;
+  const writePidFile = () => {
+    try {
+      const dir = path.dirname(pidPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const meta = {
+        pid: process.pid,
+        port,
+        host,
+        ipcDir,
+        version: SERVER_VERSION,
+        startedAt: new Date().toISOString(),
+        cfgHash,
+      };
+      const tmp = `${pidPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(meta, null, 2), "utf8");
+      fs.renameSync(tmp, pidPath);
+      pidFileWritten = true;
+    } catch {}
+  };
+
+  const removePidFile = () => {
+    if (!pidFileWritten) return;
+    pidFileWritten = false;
+    try {
+      if (fs.existsSync(pidPath)) {
+        const cur = JSON.parse(fs.readFileSync(pidPath, "utf8"));
+        if (cur && cur.pid === process.pid) {
+          fs.unlinkSync(pidPath);
+        }
+      }
+    } catch {}
+  };
 
   const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
@@ -217,10 +258,10 @@ export function startHttpServer(cliOpts = {}) {
       return;
     }
 
-    // 3. Unauthenticated healthz endpoint
+    // 3. Unauthenticated healthz endpoint (exposes pid & cfgHash, never token)
     if (req.method === "GET" && urlPath === "/healthz") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, version: SERVER_VERSION }));
+      res.end(JSON.stringify({ ok: true, version: SERVER_VERSION, pid: process.pid, cfgHash }));
       return;
     }
 
@@ -296,6 +337,7 @@ export function startHttpServer(cliOpts = {}) {
     let firstMethod = "";
     let firstTool = "";
     let anyErr = false;
+    let anyUnsupported = false;
     const replies = [];
 
     for (const item of items) {
@@ -308,7 +350,11 @@ export function startHttpServer(cliOpts = {}) {
       }
       const reply = await handleRpc(item, { ipcDir });
       if (reply !== null) {
-        if (reply.error || reply.result?.isError) anyErr = true;
+        if (reply.error?.code === -32601) {
+          anyUnsupported = true;
+        } else if (reply.error || reply.result?.isError) {
+          anyErr = true;
+        }
         replies.push(reply);
       }
     }
@@ -326,14 +372,48 @@ export function startHttpServer(cliOpts = {}) {
     }
     res.writeHead(200, headers);
     res.end(JSON.stringify(isBatch ? replies : replies[0]));
-    finishLog(firstMethod || "rpc", firstTool, anyErr ? "err" : "ok");
+    const label = anyErr ? "err" : (anyUnsupported ? "unsupported" : "ok");
+    finishLog(firstMethod || "rpc", firstTool, label);
   });
 
+  // Parent process watchdog: exit cleanly if TS6_PARENT_PID dies (prevents orphan gateways)
+  const parentPid = Number(process.env.TS6_PARENT_PID || 0);
+  let parentTimer = null;
+  if (Number.isInteger(parentPid) && parentPid > 0) {
+    parentTimer = setInterval(() => {
+      try {
+        process.kill(parentPid, 0);
+      } catch (err) {
+        if (err && err.code === "EPERM") {
+          // Process still exists under another privilege level
+          return;
+        }
+        const ts = new Date().toTimeString().slice(0, 8);
+        writeLogLine(logPath, `[${ts}] [HTTP] Parent bridge PID=${parentPid} exited; shutting down gateway PID=${process.pid}.`);
+        removePidFile();
+        try { server.close(); } catch {}
+        process.exit(0);
+      }
+    }, 5000);
+    parentTimer.unref();
+  }
+
+  const gracefulExit = () => {
+    if (parentTimer) clearInterval(parentTimer);
+    removePidFile();
+    try { server.close(); } catch {}
+    process.exit(0);
+  };
+  process.on("SIGINT", gracefulExit);
+  process.on("SIGTERM", gracefulExit);
+  process.on("exit", removePidFile);
+
   server.listen(port, host, () => {
+    writePidFile();
     const ts = new Date().toTimeString().slice(0, 8);
     writeLogLine(
       logPath,
-      `[${ts}] [HTTP] TopSolid MCP Streamable HTTP v${SERVER_VERSION} listening on http://${host}:${port}/mcp (IPC=${ipcDir})`
+      `[${ts}] [HTTP] TopSolid MCP Streamable HTTP v${SERVER_VERSION} listening on http://${host}:${port}/mcp (PID=${process.pid}, cfgHash=${cfgHash}, IPC=${ipcDir})`
     );
     if (generated) {
       process.stdout.write(`[HTTP] Generated new Bearer token (saved to ${cfgPath}): ${token}\n`);
@@ -342,6 +422,10 @@ export function startHttpServer(cliOpts = {}) {
 
   server.on("error", (err) => {
     const ts = new Date().toTimeString().slice(0, 8);
+    if (err && err.code === "EADDRINUSE") {
+      writeLogLine(logPath, `[${ts}] [HTTP] Port ${host}:${port} is already in use (EADDRINUSE, exit 98).`);
+      process.exit(98);
+    }
     writeLogLine(logPath, `[${ts}] [HTTP] Server error: ${err.message}`);
     process.exit(1);
   });
