@@ -4,6 +4,8 @@ setlocal
 set "BASE_DIR=%~dp0"
 if "%BASE_DIR:~-1%"=="\" set "BASE_DIR=%BASE_DIR:~0,-1%"
 
+if exist "%APPDATA%\TopSolid6MCP\stopped.flag" del /f /q "%APPDATA%\TopSolid6MCP\stopped.flag" >nul 2>&1
+
 if /I "%~1"=="--console" (
     echo ============================================================
     echo  TopSolid MCP Bridge (Console Mode)
@@ -14,5 +16,5 @@ if /I "%~1"=="--console" (
     exit /b %ERRORLEVEL%
 )
 
-start "" wscript.exe //B "%BASE_DIR%\agent\ts6_tray_launcher.vbs" %*
+start "" wscript.exe //B "%BASE_DIR%\agent\ts6_tray_launcher.vbs" --clear-stop %*
 exit /b 0

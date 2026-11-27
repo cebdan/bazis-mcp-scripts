@@ -109,8 +109,27 @@ claude mcp add --transport http --scope user topsolid6 http://127.0.0.1:8765/mcp
 ```
 *(Antigravity `mcp_config.json` also supports remote HTTP servers via `serverUrl` + `headers`: `{ "serverUrl": "http://10.211.55.X:8765/mcp", "headers": { "Authorization": "Bearer <TOKEN>" } }`; if your client version requires stdio, use the `--remote` proxy above.)*
 
+## Bridge Supervision & Exit Codes (v0.3.2)
+
+`agent/ts6_tray_launcher.vbs` runs as a silent supervising watchdog (`TS6_LAUNCHER=1`) that waits for `ts6_bridge.ps1` and handles its exit codes:
+
+| Exit Code | Meaning | Launcher Action |
+|---|---|---|
+| `0` | User clicked **Exit** in tray (writes `%APPDATA%\TopSolid6MCP\stopped.flag`) | Exits cleanly; does not restart until manual start or next Windows logon |
+| `3` | Another bridge instance already holds mutex `Local\TopSolid6McpBridge_v1` | Exits cleanly (prevents duplicate bridges) |
+| `10` | Bridge requested restart (**Tray → Restart** or GitHub update) | Restarts bridge immediately, resets backoff |
+| Other (`1`, `taskkill /F`, crash) | Unexpected crash / termination | Logs `[LAUNCHER] bridge exited code=N, restart in Ns` and restarts with exponential backoff (`5s → 10s → 20s → 40s → 80s → … → 5 min`, reset after 10 min uptime) |
+
+The Windows Scheduled Task `TopSolid6McpBridge` uses **two triggers**: **At logon** + a **5-minute safety trigger** (`MultipleInstances IgnoreNew`), so even if `wscript.exe` itself is killed, Task Scheduler brings both the launcher and bridge back within 5 minutes.
+
 ## Troubleshooting
-- **Mac cannot reach Windows port 8765:** check `ping <IP VM>`; ensure Windows network profile is **Private** (`Get-NetConnectionProfile`); verify the firewall rule; check `netstat -ano | findstr 8765`.
+- **Bridge won't start after clicking Exit:** **Tray → Exit** creates `%APPDATA%\TopSolid6MCP\stopped.flag` so the 5-minute safety trigger won't resurrect a manually stopped bridge during the same Windows session. Start it again via **Start Menu → TopSolid MCP → TopSolid MCP Bridge** or `Start_TopSolid6_Bridge.bat` (both automatically delete `stopped.flag`), or log out and back into Windows (stale flags older than the current logon are ignored and deleted automatically).
+- **Bridge won't stop when killing `powershell.exe`:** the supervising launcher (`wscript.exe //B ...\ts6_tray_launcher.vbs`) intentionally restarts a crashed bridge after 5 seconds. To stop cleanly, right-click the tray icon and choose **Exit**.
+- **Mac cannot reach Windows port 8765:** check `ping <IP VM>`; ensure Windows network profile is **Private** (`Get-NetConnectionProfile`); verify the firewall rule (`TopSolid MCP HTTP`, TCP 8765, `private,domain`); check `netstat -ano | findstr 8765`.
 - **`/healthz` returns 200 OK, but `tools/call` times out:** the Windows tray bridge is not running/paused, or the HTTP gateway and bridge are using different `ipcDir` paths (`ts6_bridge_info` `ipcDir` must match `TS6_IPC_DIR`).
-- **`EADDRINUSE` / orphan gateway (`mode: blocked`):** if an elevated previous gateway holds port `8765` with an old config/token, right-click the system tray icon and choose **Kill stale gateway (admin)** to terminate it with elevation and restart the gateway cleanly. If its `cfgHash` matches the current config, the bridge automatically adopts it (`mode: adopted`).
+- **`EADDRINUSE` / orphan gateway (`mode: blocked`):**
+  - When a previous gateway survives on port `8765` (for example, started elevated while the bridge runs with `RunLevel Limited`), `Start-HttpGateway` first tries `Stop-Process` and `taskkill /T /F`, logging any refusal (`WARN Orphan gateway PID=… kill failed`).
+  - If `/healthz` responds with a matching `cfgHash`, the bridge automatically adopts it (`mode: adopted`, `listening: true`).
+  - If `cfgHash` does not match (stale token/port/IPC), the bridge enters `mode: blocked` without spinning restarts, shows a tray balloon, and exposes **Tray → Kill stale gateway PID … (admin)** (`taskkill -Verb RunAs`).
+  - If a foreign process occupies port `8765`, `mode: blocked` reports its process name & PID and automatically recovers via exponential backoff once the port is freed.
 - **Parallels VM IP changes after VM recreate:** assign a DHCP reservation in Parallels Settings → Network or set a static IPv4 address in Windows.

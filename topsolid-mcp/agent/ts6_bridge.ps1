@@ -53,6 +53,8 @@ $script:AppDataDir = Join-Path $env:APPDATA "TopSolid6MCP"
 $script:ConfigPath = Join-Path $script:AppDataDir "config.json"
 $script:LogPath = Join-Path $script:AppDataDir "bridge.log"
 $script:UiCmdPath = Join-Path $script:AppDataDir "ui-cmd.json"
+$script:StoppedFlagPath = Join-Path $script:AppDataDir "stopped.flag"
+$script:ExitCode = 0
 $script:TaskName = "TopSolid6McpBridge"
 $script:StartMenuFolder = Join-Path ([Environment]::GetFolderPath("Programs")) "TopSolid MCP"
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -667,13 +669,39 @@ function Write-BridgeLog([string]$msg, [string]$level = "INFO") {
 # Windows Service (Interactive Scheduled Task) & Start Menu Management
 # ============================================================================
 function Get-BridgeServiceStatus {
+    $launcherRunning = $false
+    try {
+        $w = Get-CimInstance Win32_Process -Filter "Name='wscript.exe'" -ErrorAction SilentlyContinue | Where-Object {
+            $_.CommandLine -like "*ts6_tray_launcher.vbs*"
+        } | Select-Object -First 1
+        if ($w) { $launcherRunning = $true }
+    } catch {}
+    $lastRestart = ""
+    try {
+        if (Test-Path $script:LogPath) {
+            $m = Get-Content $script:LogPath -Tail 200 -ErrorAction SilentlyContinue | Where-Object { $_ -match '\[LAUNCHER\]' } | Select-Object -Last 1
+            if ($m) { $lastRestart = [string]$m }
+        }
+    } catch {}
     try {
         $t = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
         if ($t) {
-            return @{ installed = $true; state = [string]$t.State; taskName = $script:TaskName }
+            return @{
+                installed       = $true
+                state           = [string]$t.State
+                taskName        = $script:TaskName
+                launcherRunning = $launcherRunning
+                lastRestart     = $lastRestart
+            }
         }
     } catch {}
-    return @{ installed = $false; state = "NotInstalled"; taskName = $script:TaskName }
+    return @{
+        installed       = $false
+        state           = "NotInstalled"
+        taskName        = $script:TaskName
+        launcherRunning = $launcherRunning
+        lastRestart     = $lastRestart
+    }
 }
 
 function Install-BridgeService {
@@ -681,7 +709,8 @@ function Install-BridgeService {
         throw ("Silent launcher not found: " + $script:LauncherVbs)
     }
     $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument ("//B `"" + $script:LauncherVbs + "`"") -WorkingDirectory $script:RepoRoot
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $tLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $tRepeat = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5)
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -693,12 +722,12 @@ function Install-BridgeService {
     Register-ScheduledTask `
         -TaskName $script:TaskName `
         -Action $action `
-        -Trigger $trigger `
+        -Trigger @($tLogon, $tRepeat) `
         -Settings $settings `
         -Principal $principal `
-        -Description "TopSolid MCP Bridge (Interactive COM + System Tray Service)" `
+        -Description "TopSolid MCP Bridge (Interactive COM + System Tray Service with 5-min Safety Trigger)" `
         -Force | Out-Null
-    Write-BridgeLog "Installed Windows service task '$($script:TaskName)' (AtLogOn, interactive, auto-restart)."
+    Write-BridgeLog "Installed Windows service task '$($script:TaskName)' (AtLogOn + 5-min safety trigger, interactive, auto-restart)."
     $fwPort = [int]$script:Config.httpPort
     $fwCmd = "netsh advfirewall firewall add rule name=`"TopSolid MCP HTTP`" dir=in action=allow protocol=TCP localport=$fwPort profile=private,domain"
     try {
@@ -759,7 +788,7 @@ function Install-StartMenuShortcuts {
     $uninstallBat = Join-Path $script:RepoRoot "Uninstall_TopSolid6_MCP.bat"
 
     New-ShortcutFile (Join-Path $script:StartMenuFolder "TopSolid MCP Bridge.lnk") `
-        $wscript ("//B `"" + $script:LauncherVbs + "`"") $script:RepoRoot `
+        $wscript ("//B `"" + $script:LauncherVbs + "`" --clear-stop") $script:RepoRoot `
         "Start TopSolid MCP Bridge in System Tray" $ico
 
     New-ShortcutFile (Join-Path $script:StartMenuFolder "TopSolid MCP Info.lnk") `
@@ -825,13 +854,14 @@ if (-not $NoTray) {
     $createdNew = $false
     $script:Mutex = New-Object System.Threading.Mutex($true, "Local\TopSolid6McpBridge_v1", [ref]$createdNew)
     if (-not $createdNew) {
-        $actionName = "open_info"
-        if ($OpenSettings) { $actionName = "open_settings" }
-        elseif ($CheckUpdate) { $actionName = "check_update" }
-        elseif ($OpenInfo) { $actionName = "open_info" }
-        $cmdJson = @{ action = $actionName; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText($script:UiCmdPath, $cmdJson, $script:Utf8NoBom)
-        exit 0
+        if ($OpenSettings -or $CheckUpdate -or $OpenInfo) {
+            $actionName = "open_info"
+            if ($OpenSettings) { $actionName = "open_settings" }
+            elseif ($CheckUpdate) { $actionName = "check_update" }
+            $cmdJson = @{ action = $actionName; ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() } | ConvertTo-Json -Compress
+            [System.IO.File]::WriteAllText($script:UiCmdPath, $cmdJson, $script:Utf8NoBom)
+        }
+        exit 3
     }
 }
 
@@ -1459,17 +1489,27 @@ function Get-AppWindowIcon {
 
 function Restart-BridgeProcess {
     Write-BridgeLog "Restarting TopSolid MCP Bridge..."
+    try { if (Test-Path $script:StoppedFlagPath) { Remove-Item $script:StoppedFlagPath -Force -ErrorAction SilentlyContinue } } catch {}
     if ($script:IpcTimer) { $script:IpcTimer.Stop() }
     if ($script:NotifyIcon) { $script:NotifyIcon.Visible = $false; $script:NotifyIcon.Dispose() }
+    if ($env:TS6_LAUNCHER -eq "1") {
+        # Supervised by ts6_tray_launcher.vbs: exit with code 10 so launcher restarts cleanly
+        $script:ExitCode = 10
+        [System.Windows.Forms.Application]::Exit()
+        return
+    }
+    Stop-HttpGateway
     if ($script:Mutex) {
         try { $script:Mutex.ReleaseMutex() } catch {}
         $script:Mutex.Dispose()
+        $script:Mutex = $null
     }
     if (Test-Path $script:LauncherVbs) {
-        Start-Process -FilePath "wscript.exe" -ArgumentList ("//B `"" + $script:LauncherVbs + "`"") -WorkingDirectory $script:RepoRoot
+        Start-Process -FilePath "wscript.exe" -ArgumentList ("//B `"" + $script:LauncherVbs + "`" --clear-stop") -WorkingDirectory $script:RepoRoot
     } else {
         Start-Process -FilePath "powershell.exe" -ArgumentList ("-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"" + $PSCommandPath + "`"")
     }
+    $script:ExitCode = 0
     [System.Windows.Forms.Application]::Exit()
 }
 
@@ -2364,7 +2404,11 @@ $miOpenLog.Add_Click({
 
 $miExit = New-Object System.Windows.Forms.ToolStripMenuItem("Exit")
 $miExit.Add_Click({
-    Write-BridgeLog "Exiting TopSolid MCP Bridge."
+    Write-BridgeLog "Exiting TopSolid MCP Bridge (manual stop)."
+    try {
+        [System.IO.File]::WriteAllText($script:StoppedFlagPath, (Get-Date).ToString("o"), $script:Utf8NoBom)
+    } catch {}
+    $script:ExitCode = 0
     if ($script:IpcTimer) { $script:IpcTimer.Stop() }
     if ($script:NotifyIcon) { $script:NotifyIcon.Visible = $false; $script:NotifyIcon.Dispose() }
     [System.Windows.Forms.Application]::Exit()
@@ -2477,6 +2521,9 @@ elseif ($CheckUpdate) { Show-UpdateCheckDialog $false }
 $appContext = New-Object System.Windows.Forms.ApplicationContext
 try {
     [System.Windows.Forms.Application]::Run($appContext)
+} catch {
+    Write-BridgeLog "Unhandled top-level error: $($_.Exception.Message)" "ERROR"
+    $script:ExitCode = 1
 } finally {
     Stop-HttpGateway
     if ($script:CurrentTrayIconHandle -ne [IntPtr]::Zero) {
@@ -2488,3 +2535,4 @@ try {
         $script:Mutex.Dispose()
     }
 }
+exit $script:ExitCode
